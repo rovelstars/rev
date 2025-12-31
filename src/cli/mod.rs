@@ -1,5 +1,5 @@
 use clap::Parser;
-mod dir_rule;
+pub mod parse_service;
 mod commands;
 use crate::dashboard;
 

@@ -1,11 +1,10 @@
-use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-
+use crate::cli::parse_service::parse_service;
 use crate::init::services;
 use crate::service::start_service_from_path;
 pub async fn run() -> tokio::io::Result<()> {
-    let socket_path = "/var/run/rev-init.sock";
+    let socket_path = "./rev-init.sock";
     // Remove existing socket file if it exists
     let _ = std::fs::remove_file(socket_path);
     let listener = UnixListener::bind(socket_path)?;
@@ -68,8 +67,10 @@ async fn handle_client(stream: UnixStream) -> tokio::io::Result<()> {
 
 async fn start_service(name: &str) {
     println!("(Would start service: {})", name);
-    start_service_from_path(std::path::Path::new(&format!("./Services/{}.rsc", name)));
-    // Insert your actual start logic here
+    let (app_id, _service, file) = parse_service(name)
+        .expect("Invalid service name format. Expected format: com.example.app/service-name");
+    let service_dir = std::path::PathBuf::from(format!("./Services/{}", app_id));
+    start_service_from_path(&service_dir.join(file.file_name().unwrap()));
 }
 async fn stop_service(name: &str) {
     println!("(Would stop service: {})", name);

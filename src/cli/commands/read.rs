@@ -1,11 +1,12 @@
+use crate::cli::parse_service::parse_service;
 use crate::parser::deserialize_service_config;
 use std::fs;
-use crate::cli::dir_rule::parse_service_name;
+use std::path;
 pub fn run(service_name: &String) {
-    let (service_dir, file) = parse_service_name(service_name)
-        .expect("Failed to resolve service path");
-    //rsc = rev/rovelstars/runixOS service config
-    let service_file_path = format!("{}/{}.rsc", service_dir.display(), file);
+    let (app_id, _service, file) = parse_service(service_name)
+        .expect("Invalid service name format. Expected format: com.example.app/service-name");
+    let service_dir = path::PathBuf::from(format!("./Services/{}", app_id));
+    let service_file_path = service_dir.join(file.file_name().unwrap());
     print!("Reading {:?}\n", service_name);
     let data = fs::read(&service_file_path).expect("Failed to read service config file");
     let serialized_config = deserialize_service_config(&data);

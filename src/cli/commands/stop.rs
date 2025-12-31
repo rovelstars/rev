@@ -6,11 +6,11 @@ pub async fn run(service_name: &String) {
     let mut stream = UnixStream::connect(socket_path)
         .await
         .expect("Failed to connect to init server");
-    let command = format!("start {}\n", service_name);
+    let command = format!("stop {}\n", service_name);
     stream
         .write_all(command.as_bytes())
         .await
-        .expect("Failed to send start command");
+        .expect("Failed to send stop command");
 
     let mut reader = BufReader::new(stream);
     let mut response = String::new();
@@ -19,5 +19,5 @@ pub async fn run(service_name: &String) {
         .await
         .expect("Failed to read response from init server");
     print!("{}", response);
-    print!("Started {:?}\n", service_name);
+    print!("Stopped {:?}\n", service_name);
 }

@@ -28,3 +28,16 @@ You may make use of folders to organize your service files (eg. `rovelstars/file
 Although discouraged, service files may omit the vendor name if the service is intended for personal use only (eg. `files.indexer`).
 Similarly, the function part may be omitted if the service only has one function (eg. `rovelstars.files`).
 And finally, the entire service name may be omitted if the service is only for personal use and has only one function (eg. `test`).
+
+## TODOS:
+
+- [ ] Implement service dependencies
+- [ ] Implement service resource limits
+- [ ] Implement service logging
+- [ ] Implement service auto-restart on failure
+- [ ] Implement service status monitoring
+- [ ] Develop GUI & TUI for managing services.
+- [ ] Write comprehensive documentation and user guides.
+- [ ] Create unit and integration tests for Rev.
+- [ ] Optimize performance for handling a large number of services.
+- [ ] Implement security features to prevent unauthorized service modifications.

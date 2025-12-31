@@ -14,7 +14,13 @@ pub fn reap_zombies_loop() {
         for _ in signals.forever() {
             // Reap all dead children
             loop {
-                // Fix: pass Pid::from_raw(-1) instead of -1 directly
+                /*
+                 * TODO: When a service process exits, use the waitid() syscall with the P_PIDFD flag to wait on a specific pidfd.
+                 * This is the most modern and efficient way to reap dead processes without blocking or involving the legacy waitpid() and its
+                 * associated overheads.
+                 */
+
+                // FIXME: pass Pid::from_raw(-1) instead of -1 directly
                 match waitpid(nix::unistd::Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
                     Ok(WaitStatus::StillAlive) => break,
                     Ok(WaitStatus::Exited(pid, status)) => {
@@ -47,18 +53,25 @@ pub fn start_service_from_path(path: &std::path::Path) {
 
     // Fix: clone Name before moving it into add_service
     let name = service_config.Name.clone();
-
-    services::register_service(
-        name,
-        ServiceInfo {
-            Name: service_config.Name.clone(),
-            IsRunning: false,
-            Pid: None,
-            LastExitCode: None,
-            UpTimestamp: None,
-            Config: service_config.clone(),
-        },
-    );
+    //check if name is already registered
+    if services::get_service(&name).is_some() {
+        eprintln!("Service {} is already running or registered.", name);
+        return;
+    } else {
+        //register the service
+        println!("Registering service: {}", name);
+        services::register_service(
+            name,
+            ServiceInfo {
+                Name: service_config.Name.clone(),
+                IsRunning: false,
+                Pid: None,
+                LastExitCode: None,
+                UpTimestamp: None,
+                Config: service_config.clone(),
+            },
+        );
+    }
     println!("Starting service: {:?}", service_config);
     // we cannot just spawn the process, we need to handle it properly similarly to how systemd does it.
     // fork a new process, and then child process does execve to start the actual service binary.
@@ -78,9 +91,9 @@ pub fn start_service_from_path(path: &std::path::Path) {
         Ok(nix::unistd::ForkResult::Child) => {
             // TODO: Setup redirection of stdout/stderr to proper journaling system.
             // For now, we dont consume stdout/stderr of the child process, so throw it to /dev/null
+            /*
             use std::fs::OpenOptions;
             use std::os::unix::io::AsRawFd;
-
             let devnull = OpenOptions::new()
                 .write(true)
                 .open("/dev/null")
@@ -94,6 +107,10 @@ pub fn start_service_from_path(path: &std::path::Path) {
                     eprintln!("Failed to redirect stderr");
                 }
             }
+            */
+
+            //currently not redirecting stdout/stderr to see output in console for debugging
+
             // In the child process
             // Set up environment variables
             if !service_config.Env.is_empty() {
@@ -109,21 +126,25 @@ pub fn start_service_from_path(path: &std::path::Path) {
             }
             // Execute the service binary
             use std::ffi::CString;
-            use std::os::unix::ffi::OsStrExt;
 
-            let exec_path_cstr = CString::new(service_config.Exec.as_os_str().as_bytes())
-                .expect("Failed to convert exec path to CString");
-            // Build argument vector: first arg is the binary itself, then any additional args
-            let mut args_cstr: Vec<CString> = Vec::new();
-            args_cstr.push(exec_path_cstr.clone());
-            if let Some(ref extra_args) = service_config.Args {
-                for arg in extra_args {
-                    args_cstr.push(
-                        CString::new(arg.as_bytes()).expect("Failed to convert arg to CString"),
-                    );
-                }
+            let args = shell_words::split(&service_config.ExecStart)
+                .expect("Failed to parse ExecStart command");
+
+            if args.is_empty() {
+                eprintln!("ExecStart command is empty");
+                std::process::exit(1);
             }
+
+            let exec_path_cstr = CString::new(args[0].clone())
+                .expect("Failed to convert executable path to CString");
+
+            let args_cstr: Vec<CString> = args
+                .iter()
+                .map(|arg| CString::new(arg.clone()).expect("Failed to convert arg to CString"))
+                .collect();
+
             let args_ref: Vec<&std::ffi::CStr> = args_cstr.iter().map(|s| s.as_c_str()).collect();
+
             nix::unistd::execv(&exec_path_cstr, &args_ref)
                 .expect("Failed to execute service binary");
             unreachable!("execv only returns on error");

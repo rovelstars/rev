@@ -1,9 +1,9 @@
+use chrono::{DateTime, Utc, serde::ts_seconds_option};
 #[allow(dead_code)]
 use croner::Cron;
 use rmp_serde::{Deserializer, Serializer};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use chrono::{DateTime, serde::ts_seconds_option, Utc};
 use std::fmt;
 use std::str::FromStr;
 
@@ -42,8 +42,7 @@ impl<'de> serde::Deserialize<'de> for CronStr {
     {
         let s = String::deserialize(deserializer)?;
         // Validate the cron string using croner
-        Cron::from_str(&s)
-            .map_err(serde::de::Error::custom)?;
+        Cron::from_str(&s).map_err(serde::de::Error::custom)?;
         Ok(CronStr(s))
     }
 }
@@ -54,7 +53,6 @@ impl fmt::Display for CronStr {
     }
 }
 
-
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 #[serde(rename_all = "kebab-case")]
 pub enum RestartPolicy {
@@ -63,6 +61,49 @@ pub enum RestartPolicy {
     #[default]
     Never,
     OnResourceChange,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct EnvMap(pub HashMap<String, String>);
+
+impl<K: ToString, V: ToString> FromIterator<(K, V)> for EnvMap {
+    fn from_iter<T: IntoIterator<Item = (K, V)>>(iter: T) -> Self {
+        EnvMap(
+            iter.into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        )
+    }
+}
+
+impl<K: ToString, V: ToString, const N: usize> From<[(K, V); N]> for EnvMap {
+    fn from(arr: [(K, V); N]) -> Self {
+        arr.into_iter().collect()
+    }
+}
+
+impl std::ops::Deref for EnvMap {
+    type Target = HashMap<String, String>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for EnvMap {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl<'a> IntoIterator for &'a EnvMap {
+    type Item = (&'a String, &'a String);
+    type IntoIter = std::collections::hash_map::Iter<'a, String, String>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
 }
 
 // ServiceInfo holds runtime information about a service such as its current status, PID, last exit code, and uptime.
@@ -88,11 +129,21 @@ pub struct ServiceInfo {
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 pub struct ServiceConfig {
     pub Name: String,
-    pub Exec: std::path::PathBuf,
+    pub ExecStart: String,
     #[serde(default)]
-    pub Args: Option<Vec<String>>,
+    pub ExecStop: Option<String>,
     #[serde(default)]
-    pub Env: HashMap<String, String>,
+    pub ExecReload: Option<String>,
+    #[serde(default)]
+    pub ExecStartPre: Option<String>,
+    #[serde(default)]
+    pub ExecStartPost: Option<String>,
+    #[serde(default)]
+    pub ExecStopPre: Option<String>,
+    #[serde(default)]
+    pub ExecStopPost: Option<String>,
+    #[serde(default)]
+    pub Env: EnvMap,
     #[serde(default)]
     pub WorkingDir: Option<std::path::PathBuf>,
     pub RestartPolicy: RestartPolicy,

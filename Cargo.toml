@@ -17,6 +17,7 @@ once_cell = "1.21.3"
 ratatui = { version = "0.29.0", features = ["all-widgets"] }
 rmp-serde = "1.3.0"
 serde = { version = "1.0.228", features = ["derive"] }
+shell-words = "1.1.1"
 signal-hook = "0.3.18"
 tempfile = "3.23.0"
 tokio = { version = "1.48.0", features = ["full"] }

@@ -1,1 +1,0 @@
-™¸rovelstars.files/indexerÙ /usr/local/bin/cz-louvre-defaultÀ‚¯PKG_CONFIG_PATH¸/usr/local/lib/pkgconfig¯LD_LIBRARY_PATH¯/usr/local/lib/¡/¥neverÀ«*/5 * * * *Â

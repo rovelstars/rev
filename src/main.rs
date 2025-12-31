@@ -15,7 +15,7 @@ async fn main() {
         .last()
         .unwrap_or("");
     if invocation_name.eq("init") || std::process::id() == 1 {
-        init::run().await;
+        init::run(true).await;
     } else {
         cli::run(&args).await;
     }
