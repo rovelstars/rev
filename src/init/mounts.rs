@@ -88,6 +88,18 @@ pub fn early_mounts() {
     // reboot, lives on the root fs, no mount.
     let _ = std::fs::create_dir_all("/Transit/Volatile");
 
+    // debugfs (kernel diagnostics: dynamic_debug, tracing). Under /sys.
+    if Path::new("/sys/kernel").exists() && !already_mounted("/sys/kernel/debug") {
+        let _ = std::fs::create_dir_all("/sys/kernel/debug");
+        let _ = mount(
+            Some("debugfs"),
+            "/sys/kernel/debug",
+            Some("debugfs"),
+            MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC | MsFlags::MS_NODEV,
+            None::<&str>,
+        );
+    }
+
     // /dev/pts (needed for pseudo-terminals: sessions, terminal emulators) and
     // /dev/shm (POSIX shared memory). Only after /dev exists.
     if Path::new("/dev").exists() {
