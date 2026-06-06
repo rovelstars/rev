@@ -79,6 +79,8 @@ fn console_child() {
         std::env::set_var("LOGNAME", "root");
         std::env::set_var("SHELL", SHELL);
         std::env::set_var("TERM", "linux");
+        // RunixOS has no /tmp; temp-file software uses $TMPDIR.
+        std::env::set_var("TMPDIR", "/Transit/Ephemeral");
     }
 
     let prog = CString::new(SHELL).unwrap();

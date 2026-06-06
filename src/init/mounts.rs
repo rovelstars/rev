@@ -54,16 +54,13 @@ pub fn early_mounts() {
             flags: MsFlags::MS_NOSUID,
             data: Some("mode=0755"),
         },
+        // RunixOS runtime tree: /Transit/Ephemeral is the tmpfs cleared each
+        // boot (the /run + /tmp role). /tmp and /run are compat symlinks to it
+        // (shipped by the image). /Transit/Volatile is persistent (the /var/tmp
+        // role) and is a plain directory on the root fs, not mounted here.
         Pfs {
             source: "tmpfs",
-            target: "/run",
-            fstype: "tmpfs",
-            flags: MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
-            data: Some("mode=0755"),
-        },
-        Pfs {
-            source: "tmpfs",
-            target: "/tmp",
+            target: "/Transit/Ephemeral",
             fstype: "tmpfs",
             flags: MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
             data: Some("mode=1777"),
@@ -86,6 +83,10 @@ pub fn early_mounts() {
             Err(e) => eprintln!("rev: mount {} on {} failed: {}", p.fstype, p.target, e),
         }
     }
+
+    // /Transit/Volatile is the persistent temp tree (/var/tmp role): survives
+    // reboot, lives on the root fs, no mount.
+    let _ = std::fs::create_dir_all("/Transit/Volatile");
 
     // /dev/pts (needed for pseudo-terminals: sessions, terminal emulators) and
     // /dev/shm (POSIX shared memory). Only after /dev exists.
