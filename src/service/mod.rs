@@ -1,42 +1,35 @@
+pub mod scheduler;
+
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use signal_hook::consts::signal::SIGCHLD;
 use signal_hook::iterator::Signals;
 use std::thread;
 
 use crate::init::services;
-use crate::parser::ServiceInfo;
+use crate::parser::{RestartPolicy, ServiceConfig, ServiceInfo};
 
+/// Spawn a background thread that reaps zombie processes and handles
+/// restart policies when services exit.
 pub fn reap_zombies_loop() {
-    // Set up a signal handler for SIGCHLD
-    let mut signals = Signals::new(&[SIGCHLD]).expect("Failed to create signal handler");
+    let mut signals = Signals::new(&[SIGCHLD]).expect("failed to register SIGCHLD handler");
 
     thread::spawn(move || {
         for _ in signals.forever() {
-            // Reap all dead children
             loop {
-                /*
-                 * TODO: When a service process exits, use the waitid() syscall with the P_PIDFD flag to wait on a specific pidfd.
-                 * This is the most modern and efficient way to reap dead processes without blocking or involving the legacy waitpid() and its
-                 * associated overheads.
-                 */
-
-                // FIXME: pass Pid::from_raw(-1) instead of -1 directly
                 match waitpid(nix::unistd::Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
                     Ok(WaitStatus::StillAlive) => break,
                     Ok(WaitStatus::Exited(pid, status)) => {
-                        println!("Child {} exited with status {}", pid, status);
-                        // Update service info
-                        services::update_service_pid(None, None, Some(pid.as_raw() as i32));
+                        println!("rev: child {} exited with status {}", pid, status);
+                        handle_exit(pid.as_raw() as u32, Some(status));
                     }
                     Ok(WaitStatus::Signaled(pid, signal, _core_dumped)) => {
-                        println!("Child {} killed by signal {:?}", pid, signal);
-                        // Update service info
-                        services::update_service_pid(None, None, Some(pid.as_raw() as i32));
+                        println!("rev: child {} killed by signal {:?}", pid, signal);
+                        handle_exit(pid.as_raw() as u32, None);
                     }
                     Ok(_) => {}
-                    Err(nix::errno::Errno::ECHILD) => break, // No more children
+                    Err(nix::errno::Errno::ECHILD) => break,
                     Err(e) => {
-                        eprintln!("waitpid error: {}", e);
+                        eprintln!("rev: waitpid error: {}", e);
                         break;
                     }
                 }
@@ -45,112 +38,274 @@ pub fn reap_zombies_loop() {
     });
 }
 
-pub fn start_service_from_path(path: &std::path::Path) {
-    //read the service config file from path
-    let data = std::fs::read(path).expect("Failed to read service config file");
-    let service_config: crate::parser::ServiceConfig =
-        crate::parser::deserialize_service_config(&data);
+/// Called when a child process exits. Updates service state and
+/// handles restart policy.
+fn handle_exit(pid: u32, exit_code: Option<i32>) {
+    // Check if this was a session process
+    crate::session::handle_session_exit(pid);
 
-    // Fix: clone Name before moving it into add_service
-    let name = service_config.Name.clone();
-    //check if name is already registered
-    if services::get_service(&name).is_some() {
-        eprintln!("Service {} is already running or registered.", name);
-        return;
-    } else {
-        //register the service
-        println!("Registering service: {}", name);
-        services::register_service(
-            name,
-            ServiceInfo {
-                Name: service_config.Name.clone(),
-                IsRunning: false,
-                Pid: None,
-                LastExitCode: None,
-                UpTimestamp: None,
-                Config: service_config.clone(),
-            },
-        );
+    // Get the service info before updating (need it for restart decision)
+    let service_info = services::get_service_by_pid(pid);
+
+    // Update the service status to stopped
+    services::mark_service_exited(pid, exit_code);
+
+    // Handle restart policy
+    if let Some(info) = service_info {
+        let should_restart = match info.config.restart_policy {
+            RestartPolicy::Always => true,
+            RestartPolicy::OnFailure => exit_code.is_none_or(|c| c != 0),
+            RestartPolicy::Never => false,
+            RestartPolicy::OnResourceChange => false, // TODO: cgroup monitoring
+        };
+
+        if should_restart {
+            if let Some(ref config_path) = info.config_path {
+                let path = std::path::PathBuf::from(config_path);
+                println!(
+                    "rev: restarting {} (policy: {:?})",
+                    info.name, info.config.restart_policy
+                );
+                crate::logger::write_log(
+                    &info.name,
+                    &format!(
+                        "Service exited (code: {:?}), restarting per {:?} policy",
+                        exit_code, info.config.restart_policy
+                    ),
+                );
+                // Small delay to avoid tight restart loops
+                thread::sleep(std::time::Duration::from_millis(500));
+                // Deregister so start_service_from_path can re-register
+                services::deregister_service(&info.name);
+                start_service_from_path(&path);
+                // Increment restart count
+                services::increment_restart_count(&info.name);
+            }
+        } else {
+            // Run exec-stop-post hook if defined
+            if let Some(ref hook) = info.config.exec_stop_post {
+                run_hook(hook, &info.config);
+            }
+        }
     }
-    println!("Starting service: {:?}", service_config);
-    // we cannot just spawn the process, we need to handle it properly similarly to how systemd does it.
-    // fork a new process, and then child process does execve to start the actual service binary.
+}
+
+/// Run a shell command as a hook (exec-start-pre, exec-start-post, etc.)
+/// Blocks until the command finishes. Returns true on success.
+pub fn run_hook(command: &str, config: &ServiceConfig) -> bool {
+    let args = match shell_words::split(command) {
+        Ok(a) if !a.is_empty() => a,
+        Ok(_) => {
+            eprintln!("rev: empty hook command");
+            return false;
+        }
+        Err(e) => {
+            eprintln!("rev: failed to parse hook command '{}': {}", command, e);
+            return false;
+        }
+    };
+
+    let mut cmd = std::process::Command::new(&args[0]);
+    cmd.args(&args[1..]);
+
+    // Inherit environment
+    for (key, value) in &config.env {
+        cmd.env(key, value);
+    }
+    if let Some(ref dir) = config.working_dir {
+        cmd.current_dir(dir);
+    }
+
+    match cmd.status() {
+        Ok(status) => {
+            if !status.success() {
+                eprintln!(
+                    "rev: hook '{}' failed with exit code {:?}",
+                    command,
+                    status.code()
+                );
+            }
+            status.success()
+        }
+        Err(e) => {
+            eprintln!("rev: failed to run hook '{}': {}", command, e);
+            false
+        }
+    }
+}
+
+/// Stop a running service. Uses exec-stop if defined, otherwise SIGTERM
+/// with timeout fallback to SIGKILL.
+pub fn stop_service(info: &ServiceInfo) {
+    let pid = match info.pid {
+        Some(p) => p,
+        None => return,
+    };
+
+    crate::logger::write_log(&info.name, "Stopping service");
+
+    // Run exec-stop-pre hook if defined
+    if let Some(ref hook) = info.config.exec_stop_pre {
+        run_hook(hook, &info.config);
+    }
+
+    if let Some(ref exec_stop) = info.config.exec_stop {
+        // Use the defined stop command
+        if !run_hook(exec_stop, &info.config) {
+            // Stop command failed — fall back to SIGTERM
+            eprintln!(
+                "rev: exec-stop failed for {}, falling back to SIGTERM",
+                info.name
+            );
+            send_signal_with_timeout(pid, info.config.timeout_stop.unwrap_or(10));
+        }
+    } else {
+        // No exec-stop — use SIGTERM + timeout
+        send_signal_with_timeout(pid, info.config.timeout_stop.unwrap_or(10));
+    }
+}
+
+/// Send SIGTERM, wait up to `timeout_secs`, then SIGKILL if still alive.
+fn send_signal_with_timeout(pid: u32, timeout_secs: u64) {
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+
+    // Poll whether the process is still alive
+    while std::time::Instant::now() < deadline {
+        // Check if process still exists (kill with signal 0)
+        let alive = unsafe { libc::kill(pid as i32, 0) } == 0;
+        if !alive {
+            return;
+        }
+        thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    // Timeout — force kill
+    eprintln!(
+        "rev: service PID {} did not stop within {}s, sending SIGKILL",
+        pid, timeout_secs
+    );
+    unsafe {
+        libc::kill(pid as i32, libc::SIGKILL);
+    }
+}
+
+/// Start a service from its .rsc config file path.
+pub fn start_service_from_path(path: &std::path::Path) {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("rev: failed to read {}: {}", path.display(), e);
+            return;
+        }
+    };
+    let config = match crate::parser::deserialize_service_config(&text) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("rev: failed to parse {}: {}", path.display(), e);
+            return;
+        }
+    };
+
+    let name = config.name.clone();
+
+    if services::get_service(&name).is_some() {
+        eprintln!("rev: service {} is already registered", name);
+        return;
+    }
+
+    services::register_service(
+        name.clone(),
+        ServiceInfo {
+            name: config.name.clone(),
+            config_path: Some(path.display().to_string()),
+            config: config.clone(),
+            ..Default::default()
+        },
+    );
+
+    // Run exec-start-pre hook
+    if let Some(ref hook) = config.exec_start_pre {
+        if !run_hook(hook, &config) {
+            eprintln!("rev: exec-start-pre failed for {}, aborting start", name);
+            services::deregister_service(&name);
+            return;
+        }
+    }
+
+    println!("rev: starting service {}", name);
+
     match unsafe { nix::unistd::fork() } {
         Ok(nix::unistd::ForkResult::Parent { child, .. }) => {
-            // In the parent process
-            println!("Started service with PID: {}", child);
-            services::update_service_pid(
-                Some(&service_config.Name),
-                Some(child.as_raw() as i32),
-                None,
-            );
-            // Here we would typically add the child PID to a tracking structure
-            // to monitor its status and handle restarts based on the RestartPolicy.
+            println!("rev: {} started (PID {})", name, child);
+            crate::logger::write_log(&name, &format!("Service started (PID {})", child));
+            services::update_service_pid(Some(&name), Some(child.as_raw() as i32), None);
+
+            // Run exec-start-post hook
+            if let Some(ref hook) = config.exec_start_post {
+                run_hook(hook, &config);
+            }
         }
         #[allow(unreachable_code)]
         Ok(nix::unistd::ForkResult::Child) => {
-            // TODO: Setup redirection of stdout/stderr to proper journaling system.
-            // For now, we dont consume stdout/stderr of the child process, so throw it to /dev/null
-            /*
-            use std::fs::OpenOptions;
+            // Redirect stdout/stderr to log file
             use std::os::unix::io::AsRawFd;
-            let devnull = OpenOptions::new()
-                .write(true)
-                .open("/dev/null")
-                .expect("Failed to open /dev/null");
-            // Fix: Use libc::dup2 directly to avoid trait bound issues with nix::unistd::dup2
-            unsafe {
-                if libc::dup2(devnull.as_raw_fd(), libc::STDOUT_FILENO) == -1 {
-                    eprintln!("Failed to redirect stdout");
-                }
-                if libc::dup2(devnull.as_raw_fd(), libc::STDERR_FILENO) == -1 {
-                    eprintln!("Failed to redirect stderr");
+            match crate::logger::open_log_fds(&config.name) {
+                Ok((stdout_file, stderr_file)) => unsafe {
+                    libc::dup2(stdout_file.as_raw_fd(), libc::STDOUT_FILENO);
+                    libc::dup2(stderr_file.as_raw_fd(), libc::STDERR_FILENO);
+                },
+                Err(e) => {
+                    eprintln!("rev: failed to open log for {}: {}", config.name, e);
                 }
             }
-            */
 
-            //currently not redirecting stdout/stderr to see output in console for debugging
-
-            // In the child process
-            // Set up environment variables
-            if !service_config.Env.is_empty() {
-                for (key, value) in &service_config.Env {
-                    unsafe {
-                        std::env::set_var(key, value);
-                    }
+            // Set environment variables
+            for (key, value) in &config.env {
+                unsafe {
+                    std::env::set_var(key, value);
                 }
             }
+
             // Change working directory if specified
-            if let Some(ref dir) = service_config.WorkingDir {
-                nix::unistd::chdir(dir).expect("Failed to change working directory");
+            if let Some(ref dir) = config.working_dir {
+                if let Err(e) = nix::unistd::chdir(dir.as_path()) {
+                    eprintln!("rev: failed to chdir to {}: {}", dir.display(), e);
+                    std::process::exit(1);
+                }
             }
-            // Execute the service binary
+
+            // Parse and execute the command
             use std::ffi::CString;
 
-            let args = shell_words::split(&service_config.ExecStart)
-                .expect("Failed to parse ExecStart command");
+            let args = match shell_words::split(&config.exec_start) {
+                Ok(a) => a,
+                Err(e) => {
+                    eprintln!("rev: failed to parse exec-start: {}", e);
+                    std::process::exit(1);
+                }
+            };
 
             if args.is_empty() {
-                eprintln!("ExecStart command is empty");
+                eprintln!("rev: exec-start is empty");
                 std::process::exit(1);
             }
 
-            let exec_path_cstr = CString::new(args[0].clone())
-                .expect("Failed to convert executable path to CString");
-
+            let exec_path = CString::new(args[0].clone()).expect("invalid executable path");
             let args_cstr: Vec<CString> = args
                 .iter()
-                .map(|arg| CString::new(arg.clone()).expect("Failed to convert arg to CString"))
+                .map(|arg| CString::new(arg.clone()).expect("invalid argument"))
                 .collect();
-
             let args_ref: Vec<&std::ffi::CStr> = args_cstr.iter().map(|s| s.as_c_str()).collect();
 
-            nix::unistd::execv(&exec_path_cstr, &args_ref)
-                .expect("Failed to execute service binary");
-            unreachable!("execv only returns on error");
+            nix::unistd::execv(&exec_path, &args_ref).expect("execv failed");
+            unreachable!();
         }
-        Err(err) => {
-            eprintln!("Fork failed: {}", err);
+        Err(e) => {
+            eprintln!("rev: fork failed: {}", e);
         }
     }
 }

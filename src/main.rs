@@ -1,8 +1,12 @@
+mod bus;
 mod cli;
 mod dashboard;
 mod init;
+pub mod logger;
 mod parser;
+mod seat;
 mod service;
+mod session;
 
 #[tokio::main]
 async fn main() {

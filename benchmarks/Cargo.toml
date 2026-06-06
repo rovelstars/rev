@@ -1,0 +1,52 @@
+[package]
+name = "rev-benchmarks"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Hyperfine-driven microbenchmarks comparing rev/WireBus with systemd/DBus."
+
+# Each bench is a small CLI that takes an iteration count and exits — the
+# intended usage is `hyperfine 'bench-x 10000' 'bench-y 10000'` so total
+# wall-time / N gives per-op latency without shell-startup noise.
+
+[dependencies]
+# WireBus protocol: we speak the same length-prefixed MessagePack frame
+# format as rev/src/bus/protocol.rs. We redeclare the minimum enum variants
+# we need here because rev is a binary crate, not a library; keep the
+# variant names & serde tags in sync with rev/src/bus/protocol.rs.
+rmp-serde = "1.3"
+serde = { version = "1", features = ["derive"] }
+
+# DBus in pure Rust. `blocking` sub-API keeps the bench loops as
+# simple synchronous code — fair vs. the WireBus sync-socket path.
+zbus = { version = "5", features = ["blocking-api"] }
+nix = { version = "0.30", features = ["socket", "uio"] }
+
+# CLI arg parsing — tiny + fast, matches rev itself.
+clap = { version = "4", features = ["derive"] }
+
+# libc for SCM_RIGHTS recv and a few socket knobs.
+libc = "0.2"
+
+[[bin]]
+name = "bench-wirebus-rtt"
+path = "src/bin/bench-wirebus-rtt.rs"
+
+[[bin]]
+name = "bench-dbus-rtt"
+path = "src/bin/bench-dbus-rtt.rs"
+
+[[bin]]
+name = "bench-wirebus-connect"
+path = "src/bin/bench-wirebus-connect.rs"
+
+[[bin]]
+name = "bench-dbus-connect"
+path = "src/bin/bench-dbus-connect.rs"
+
+[profile.release]
+# Single-crate, small binaries — fatter opts are cheap and matter for
+# tight IPC loops.
+lto = "fat"
+codegen-units = 1
+opt-level = 3
