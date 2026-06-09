@@ -1,3 +1,4 @@
+mod auth;
 mod bus;
 mod cli;
 mod dashboard;

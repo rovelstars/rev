@@ -189,6 +189,10 @@ pub fn exec_as(
         return Err(format!("command not found: {}", command[0]));
     }
 
+    // Resolve the target's real identity through UAC (gid/home/shell), not a
+    // gid==uid guess. Done before the fork so failures report cleanly.
+    let target = crate::auth::resolve_target(target_uid)?;
+
     match unsafe { nix::unistd::fork() } {
         Ok(nix::unistd::ForkResult::Parent { child, .. }) => {
             let pid = child.as_raw() as u32;
@@ -203,12 +207,11 @@ pub fn exec_as(
         }
         #[allow(unreachable_code)]
         Ok(nix::unistd::ForkResult::Child) => {
-            // Drop to target user if not root
+            // Drop to the target user (gid first, since after setuid we could no
+            // longer change the gid). A no-op when target is root.
             if target_uid != 0 {
-                // Look up the user's gid (simplified — in production, query user database)
-                let gid = target_uid; // fallback: gid = uid
-                if let Err(e) = nix::unistd::setgid(nix::unistd::Gid::from_raw(gid)) {
-                    eprintln!("rev: exec_as setgid({}) failed: {}", gid, e);
+                if let Err(e) = nix::unistd::setgid(nix::unistd::Gid::from_raw(target.gid)) {
+                    eprintln!("rev: exec_as setgid({}) failed: {}", target.gid, e);
                     std::process::exit(1);
                 }
                 if let Err(e) = nix::unistd::setuid(nix::unistd::Uid::from_raw(target_uid)) {
@@ -217,28 +220,24 @@ pub fn exec_as(
                 }
             }
 
-            // Sanitize environment — start clean for root exec
-            if target_uid == 0 {
-                unsafe {
-                    std::env::set_var("PATH", "/Core/Bin:/Construct/Bin");
-                    std::env::set_var("HOME", "/Space/root");
-                    std::env::remove_var("LD_PRELOAD");
-                    std::env::remove_var("LD_LIBRARY_PATH");
+            // Build a pristine environment. We NEVER inherit the caller's env
+            // wholesale -- that is the setuid hole (LD_PRELOAD, LD_LIBRARY_PATH,
+            // IFS, ... hijack a root process). Clear everything, set the basics
+            // ourselves, then admit only an allowlisted display/locale subset
+            // from the caller. Mirrors rexecd.
+            unsafe {
+                for (key, _) in std::env::vars().collect::<Vec<_>>() {
+                    std::env::remove_var(key);
                 }
-            }
-
-            // Set caller-provided env vars
-            for (key, value) in env {
-                // Block dangerous env vars for root exec
-                if target_uid == 0
-                    && (key == "LD_PRELOAD"
-                        || key == "LD_LIBRARY_PATH"
-                        || key.starts_with("LD_"))
-                {
-                    continue; // silently drop
-                }
-                unsafe {
-                    std::env::set_var(key, value);
+                std::env::set_var("USER", &target.name);
+                std::env::set_var("LOGNAME", &target.name);
+                std::env::set_var("HOME", &target.home);
+                std::env::set_var("SHELL", &target.shell);
+                std::env::set_var("PATH", "/Core/Bin:/Construct/Bin");
+                for (key, value) in env {
+                    if crate::auth::env_allowed(key) {
+                        std::env::set_var(key, value);
+                    }
                 }
             }
 

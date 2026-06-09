@@ -168,6 +168,11 @@ async fn handle_client(
     stream: UnixStream,
     clients: ClientWriters,
 ) -> std::io::Result<()> {
+    // The connecting peer's uid, straight from the kernel (SO_PEERCRED). Used to
+    // authorize privilege-granting requests; a client cannot forge it.
+    let peer_uid = nix::sys::socket::getsockopt(&stream, nix::sys::socket::sockopt::PeerCredentials)
+        .ok()
+        .map(|c| c.uid());
     let (mut reader, mut writer) = stream.into_split();
 
     // Each client gets a channel for receiving signal deliveries.
@@ -245,7 +250,7 @@ async fn handle_client(
                     None
                 };
 
-                let result = handle_message(&msg, &clients).await;
+                let result = handle_message(&msg, &clients, peer_uid).await;
 
                 // Send the response frame via tokio's async writer.
                 protocol::send_message(&mut writer, &result.response).await?;
@@ -282,11 +287,12 @@ async fn handle_client(
     }
 }
 
-async fn handle_message(msg: &Message, clients: &ClientWriters) -> HandleResult {
+async fn handle_message(msg: &Message, clients: &ClientWriters, peer_uid: Option<u32>) -> HandleResult {
     let id = msg.id;
 
-    // TODO: When Rook Guard is implemented, verify msg.auth_token here
-    // for privileged operations. For now, all operations are permitted.
+    // Privilege-granting requests (ExecAs, StartSession) authorize against
+    // RookGuard + UAC below, keyed on the unforgeable peer uid. Other requests
+    // are non-privileged.
     // Privileged operations that will require auth:
     //   - Register on System Highway
     //   - Cross-lane access (User Lane -> System Highway)
@@ -427,17 +433,23 @@ async fn handle_message(msg: &Message, clients: &ClientWriters) -> HandleResult 
             env,
             working_dir,
         } => {
-            // TODO: Verify msg.auth_token against Rook Guard before allowing.
-            // For now, log a warning that auth is not yet enforced.
-            if msg.auth_token.is_none() {
-                eprintln!(
-                    "rev: WARNING: ExecAs from '{}' without auth token (Rook Guard not yet implemented)",
-                    msg.sender
-                );
-            }
-            match crate::session::exec_as(*uid, command, env, working_dir.as_ref()) {
-                Ok(pid) => reply(id, MessageBody::ExecAsResult { pid }),
-                Err(e) => err_reply(id, e),
+            // Authorize against RookGuard + UAC, keyed on the unforgeable peer
+            // uid. Fail closed: no proof, no elevation.
+            match crate::auth::authorize_elevation(peer_uid, msg.auth_token.as_deref()) {
+                Ok(caller) => {
+                    crate::logger::write_log(
+                        "rev",
+                        &format!("ExecAs authorized for {} -> run as uid {}", caller, uid),
+                    );
+                    match crate::session::exec_as(*uid, command, env, working_dir.as_ref()) {
+                        Ok(pid) => reply(id, MessageBody::ExecAsResult { pid }),
+                        Err(e) => err_reply(id, e),
+                    }
+                }
+                Err(e) => {
+                    eprintln!("rev: ExecAs from '{}' denied: {}", msg.sender, e);
+                    err_reply(id, format!("ExecAs denied: {e}"))
+                }
             }
         }
 
@@ -449,25 +461,31 @@ async fn handle_message(msg: &Message, clients: &ClientWriters) -> HandleResult 
             command,
             env,
         } => {
-            if msg.auth_token.is_none() {
+            // Spawning a session as an arbitrary user is privileged: only a root
+            // caller (the login manager / greeter, which has already
+            // authenticated the user via RookGuard) may do it. A session for
+            // uid 0 would otherwise run a root shell for anyone.
+            if peer_uid != Some(0) {
                 eprintln!(
-                    "rev: WARNING: StartSession from '{}' without auth token",
+                    "rev: StartSession from '{}' denied: caller is not privileged",
                     msg.sender
                 );
-            }
-            match crate::session::start_session(*uid, *gid, username, command, env) {
-                Ok(session) => {
-                    crate::seat::set_active_session(session.session_id);
-                    reply(
-                        id,
-                        MessageBody::SessionStarted {
-                            session_id: session.session_id,
-                            pid: session.pid,
-                            lane_socket: session.lane_socket,
-                        },
-                    )
+                err_reply(id, "StartSession denied: caller is not privileged".to_string())
+            } else {
+                match crate::session::start_session(*uid, *gid, username, command, env) {
+                    Ok(session) => {
+                        crate::seat::set_active_session(session.session_id);
+                        reply(
+                            id,
+                            MessageBody::SessionStarted {
+                                session_id: session.session_id,
+                                pid: session.pid,
+                                lane_socket: session.lane_socket,
+                            },
+                        )
+                    }
+                    Err(e) => err_reply(id, e),
                 }
-                Err(e) => err_reply(id, e),
             }
         }
         MessageBody::EndSession { session_id } => {
