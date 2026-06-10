@@ -60,6 +60,24 @@ const ALLOWED_PREFIXES: &[&str] = &[
 const DRM_IOCTL_SET_MASTER: libc::c_ulong = 0x0000_641e;
 const DRM_IOCTL_DROP_MASTER: libc::c_ulong = 0x0000_641f;
 
+// EVIOCREVOKE (_IOW('E', 0x91, int)) revokes an evdev open file description.
+// Closing Rev's own fd does NOT cut off a compositor that holds an SCM_RIGHTS
+// dup: the dup is a separate fd on the same struct file. EVIOCREVOKE kills the
+// struct file itself, so every holder (the compositor's dup included) gets
+// ENODEV. This is the only correct way to take a backgrounded session's input
+// away on a VT switch or teardown -- otherwise it keeps reading the keyboard.
+// Validated in a VM (Rignite/seat-fdpass-smoke).
+const EVIOCREVOKE: libc::c_ulong = 0x4004_4591;
+
+/// True for an evdev input node (/dev/input/event*), the only kind EVIOCREVOKE
+/// applies to.
+fn is_evdev(path: &std::path::Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.starts_with("event"))
+        .unwrap_or(false)
+}
+
 /// True for a DRM primary node (/dev/dri/card*), which is the one that carries
 /// modeset/master rights. Render nodes (/dev/dri/renderD*) never need master.
 fn is_drm_primary(path: &std::path::Path) -> bool {
@@ -148,6 +166,10 @@ pub fn close_device(session_id: u64, path: &str) -> Result<(), String> {
     if let Some(devices) = state.session_devices.get_mut(&session_id) {
         if let Some(idx) = devices.iter().position(|d| d.path.as_os_str() == path) {
             let dev = devices.remove(idx);
+            // Revoke before closing so the compositor's SCM_RIGHTS dup dies too.
+            if is_evdev(&dev.path) {
+                unsafe { libc::ioctl(dev.fd, EVIOCREVOKE, 0); }
+            }
             unsafe { libc::close(dev.fd); }
             Ok(())
         } else {
@@ -163,7 +185,26 @@ pub fn close_all_devices(session_id: u64) {
     let mut state = STATE.lock().expect("seat state lock poisoned");
     if let Some(devices) = state.session_devices.remove(&session_id) {
         for dev in devices {
+            if is_evdev(&dev.path) {
+                unsafe { libc::ioctl(dev.fd, EVIOCREVOKE, 0); }
+            }
             unsafe { libc::close(dev.fd); }
+        }
+    }
+}
+
+/// Revoke all of a session's input fds without closing them, cutting the
+/// compositor off from the keyboard/mouse. Called on VT switch away (alongside
+/// PauseDevice). The fds stay tracked so a fresh open can be handed back on
+/// resume.
+#[allow(dead_code)] // wired in with the VT-switch pause/resume path
+pub fn revoke_input(session_id: u64) {
+    let state = STATE.lock().expect("seat state lock poisoned");
+    if let Some(devices) = state.session_devices.get(&session_id) {
+        for dev in devices {
+            if is_evdev(&dev.path) {
+                unsafe { libc::ioctl(dev.fd, EVIOCREVOKE, 0); }
+            }
         }
     }
 }
