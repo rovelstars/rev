@@ -1,4 +1,5 @@
 mod create;
+mod install;
 mod read;
 mod service_client;
 mod start;
@@ -24,6 +25,15 @@ pub enum Commands {
     Stop {
         service_name: String,
     },
+    /// Validate a .rsc service file and install it: system-wide into
+    /// /Construct/Services, or per-user (--user) into the account vault.
+    Install {
+        /// Path to the .rsc file to install.
+        file: String,
+        /// Install as a per-user service instead of system-wide.
+        #[arg(long)]
+        user: bool,
+    },
     /// Run only the WireBus System Highway, without any init behaviour. A
     /// dev and benchmark helper: it brings up the bus server on the configured
     /// Highway socket and serves until killed. Hidden from normal help.
@@ -47,6 +57,9 @@ pub async fn execute_command(command: Commands) {
         }
         Commands::Stop { service_name } => {
             stop::run(&service_name).await;
+        }
+        Commands::Install { file, user } => {
+            install::run(&file, user);
         }
         Commands::BusServe => {
             let sock = crate::bus::socket_path();
