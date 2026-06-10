@@ -17,10 +17,13 @@ pub fn service_dirs() -> Vec<PathBuf> {
         vec![PathBuf::from("./Services")]
     } else {
         vec![
+            // OOTB services (immutable). A `scope` field, not the directory,
+            // decides whether each runs system-wide at boot or per-user at login.
             PathBuf::from("/Core/Services"),
-            PathBuf::from("/Core/UserServices"),
+            // Installed system-wide (mutable layer over the immutable Core).
             PathBuf::from("/Construct/Services"),
-            // Per-user services are handled separately via /Space/*/.Services
+            // Per-user installed services live in the account vault, loaded on
+            // that user's Lane at login (see bus::lanes::user_service_dir).
         ]
     }
 }
@@ -86,6 +89,21 @@ pub enum RestartPolicy {
     #[default]
     Never,
     OnResourceChange,
+}
+
+/// Where and when a service runs. This is data on the service, not a function of
+/// which directory it lives in, so the same `/Core/Services` tree can hold both
+/// system services and per-user defaults.
+#[derive(Debug, Serialize, Deserialize, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ServiceScope {
+    /// Started at boot on the System Highway, as root (or the configured user).
+    #[default]
+    System,
+    /// Started on a user's Lane just after that user logs in, as that user. OOTB
+    /// per-user defaults ship in /Core/Services with this scope; user-installed
+    /// ones live in the account's vault.
+    User,
 }
 
 // ---------------------------------------------------------------------------
@@ -168,6 +186,9 @@ pub struct ServiceConfig {
     pub working_dir: Option<PathBuf>,
     #[serde(default)]
     pub restart_policy: RestartPolicy,
+    /// Whether this service runs system-wide at boot or per-user at login.
+    #[serde(default)]
+    pub scope: ServiceScope,
     /// WireBus names this service provides. When a Lookup for one of these
     /// names misses on the Highway, rev starts this service (bus-activation)
     /// and waits for it to register the name before answering the Lookup.

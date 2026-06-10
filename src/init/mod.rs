@@ -118,7 +118,19 @@ pub async fn run(auto_start: bool) {
             }
         }
 
-        let sortable: Vec<(String, crate::parser::ServiceConfig)> = candidates
+        // Only system-scope services start at boot on the Highway. User-scope
+        // services start per-user on a Lane at login, so they are deferred here.
+        let (system, user): (Vec<_>, Vec<_>) = candidates
+            .into_iter()
+            .partition(|(_, cfg, _)| cfg.scope == crate::parser::ServiceScope::System);
+        if !user.is_empty() {
+            println!(
+                "rev: {} user-scope service(s) deferred to per-user lanes",
+                user.len()
+            );
+        }
+
+        let sortable: Vec<(String, crate::parser::ServiceConfig)> = system
             .iter()
             .map(|(name, config, _)| (name.clone(), config.clone()))
             .collect();
@@ -130,7 +142,7 @@ pub async fn run(auto_start: bool) {
             );
         }
         for idx in order {
-            crate::service::start_service_from_path(&candidates[idx].2);
+            crate::service::start_service_from_path(&system[idx].2);
         }
     }
 

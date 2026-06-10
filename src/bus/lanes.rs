@@ -36,12 +36,18 @@ pub fn user_lane_path(uid: u32) -> PathBuf {
     }
 }
 
-/// Returns the service directory for a user's personal services.
-pub fn user_service_dir(username: &str) -> PathBuf {
+/// Returns the directory holding a user's personally-installed services, keyed
+/// by the account's stable UUID.
+///
+/// These live in the account's vault, not the user's home: a home dotfolder is
+/// cluttered, casually findable, and freely editable, whereas the vault tree is
+/// root-owned and managed through rev's tooling. The UUID (rather than the
+/// username) keys it so a rename does not strand the services.
+pub fn user_service_dir(account_uuid: &str) -> PathBuf {
     if cfg!(debug_assertions) {
-        PathBuf::from(format!("./UserServices/{}", username))
+        PathBuf::from(format!("./Vault/Services/{}", account_uuid))
     } else {
-        PathBuf::from(format!("/Space/{}/.Services", username))
+        PathBuf::from(format!("/Vault/Services/{}", account_uuid))
     }
 }
 
