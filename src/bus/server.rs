@@ -118,6 +118,13 @@ fn seat_session(principal: &Principal) -> Option<u64> {
 
 static NEXT_MSG_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Maximum concurrent connections to a single bus. Each open connection holds
+/// one permit until it disconnects; long-lived peers (registered services,
+/// signal subscribers, a compositor's seat connection) each consume one, so the
+/// ceiling is set high enough not to starve a real system while still bounding a
+/// local connection flood on the world-connectable Highway.
+const MAX_BUS_CONNECTIONS: usize = 1024;
+
 fn next_id() -> u64 {
     NEXT_MSG_ID.fetch_add(1, Ordering::Relaxed)
 }
@@ -188,11 +195,40 @@ pub async fn run(socket_path: &str, tier: Tier) -> std::io::Result<()> {
     // separate, so lanes cannot see one another's registrations.
     let registry = Arc::new(registry::Registry::new());
 
+    // Bound concurrent connections. The Highway is world-connectable, so without
+    // a cap any local process could open connections without limit and exhaust
+    // rev's memory and task scheduler. Each connection holds one permit for its
+    // whole lifetime (a registered service or signal subscriber is long-lived),
+    // so the limit is generous; excess connections are refused and the peer
+    // retries. Applies to Lanes too, where it only bounds a single user.
+    let conn_limit = Arc::new(tokio::sync::Semaphore::new(MAX_BUS_CONNECTIONS));
+    let mut at_capacity = false;
+
     loop {
         let (stream, _) = listener.accept().await?;
+        let permit = match conn_limit.clone().try_acquire_owned() {
+            Ok(p) => {
+                at_capacity = false;
+                p
+            }
+            Err(_) => {
+                // Log once per saturation episode, not once per refused connect,
+                // so a flood cannot also flood the log.
+                if !at_capacity {
+                    eprintln!(
+                        "rev: wirebus at connection limit ({}); refusing new connections",
+                        MAX_BUS_CONNECTIONS
+                    );
+                    at_capacity = true;
+                }
+                continue; // drop `stream`: the connection is closed
+            }
+        };
         let clients = clients.clone();
         let registry = registry.clone();
         tokio::spawn(async move {
+            // Hold the permit for the connection's lifetime; released on return.
+            let _permit = permit;
             if let Err(e) = handle_client(stream, clients, registry, tier).await {
                 // Silence expected disconnects and garbage connections
                 // (e.g. desktop services probing the socket file)
