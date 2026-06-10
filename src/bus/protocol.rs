@@ -78,12 +78,16 @@ pub async fn recv_message<R: AsyncReadExt + Unpin>(reader: &mut R) -> std::io::R
 pub struct Message {
     /// Unique message ID for request/response correlation.
     pub id: u64,
-    /// Who sent this message (service name, or "rev" for the init).
+    /// A client-supplied label used for signal-delivery addressing. It is NOT an
+    /// identity: a client can set it to anything, so it is never used for
+    /// authorization. Who a peer *is* comes from the kernel socket credential
+    /// (SO_PEERCRED), and what names it owns comes from the bus registry; to emit
+    /// a signal as a name, the peer must actually hold that registration.
     pub sender: String,
-    /// Authentication token for Rook Guard verification.
-    /// None for unauthenticated requests (pre-Rook Guard).
-    /// When Rook Guard is active, this must contain a valid session token
-    /// for privileged operations (Register on Highway, cross-lane access).
+    /// A RookGuard capability token, verified server-side and bound to the
+    /// connecting peer. Present only for operations the policy escalates
+    /// (Elevated): running as another user, or administering system / other
+    /// users' services. Ambient (own-scope) operations carry no token.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_token: Option<String>,
     pub body: MessageBody,

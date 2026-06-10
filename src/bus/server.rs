@@ -209,12 +209,16 @@ pub async fn run(socket_path: &str, tier: Tier) -> std::io::Result<()> {
     println!("rev: wirebus listening on {}", socket_path);
 
     let clients: ClientWriters = Arc::new(Mutex::new(HashMap::new()));
+    // One registry per bus: the Highway's names and each Lane's names are
+    // separate, so lanes cannot see one another's registrations.
+    let registry = Arc::new(registry::Registry::new());
 
     loop {
         let (stream, _) = listener.accept().await?;
         let clients = clients.clone();
+        let registry = registry.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_client(stream, clients, tier).await {
+            if let Err(e) = handle_client(stream, clients, registry, tier).await {
                 // Silence expected disconnects and garbage connections
                 // (e.g. desktop services probing the socket file)
                 match e.kind() {
@@ -236,6 +240,7 @@ pub async fn run(socket_path: &str, tier: Tier) -> std::io::Result<()> {
 async fn handle_client(
     stream: UnixStream,
     clients: ClientWriters,
+    registry: Arc<registry::Registry>,
     tier: Tier,
 ) -> std::io::Result<()> {
     // The connecting peer's uid, straight from the kernel (SO_PEERCRED). A client
@@ -334,7 +339,7 @@ async fn handle_client(
                     None
                 };
 
-                let result = handle_message(&msg, &clients, principal, tier).await;
+                let result = handle_message(&msg, &clients, &registry, principal, tier).await;
 
                 // Send the response frame via tokio's async writer.
                 protocol::send_message(&mut writer, &result.response).await?;
@@ -406,11 +411,20 @@ fn uac_is_admin(uid: u32) -> bool {
 /// are not valid client requests and fall through to an error reply without an
 /// authorization decision. Service control is scoped by tier: on a Lane it
 /// targets that user's own services; on the Highway it targets system services.
-fn classify(body: &MessageBody, tier: Tier) -> Option<Operation> {
+fn classify(
+    body: &MessageBody,
+    tier: Tier,
+    principal: &Principal,
+    registry: &registry::Registry,
+    sender: &str,
+) -> Option<Operation> {
     let service_scope = match tier {
         Tier::Lane { uid } => Scope::OwnUser(uid),
         Tier::Highway => Scope::SystemOrOtherUser,
     };
+    // Whether `principal` owns the registered name `n`. A System principal (uid
+    // 0) matches system registrations; a user matches its own.
+    let owns = |n: &str| matches!(registry.owner_of(n), Some(o) if Some(o) == principal.uid());
     Some(match body {
         MessageBody::Lookup { .. }
         | MessageBody::ListBus
@@ -420,11 +434,20 @@ fn classify(body: &MessageBody, tier: Tier) -> Option<Operation> {
         MessageBody::Subscribe { .. } | MessageBody::Unsubscribe { .. } => {
             Operation::SignalSubscribe
         }
-        // Ownership of the name is enforced in phase 4 (registry owner tracking);
-        // until then these route through the policy as owned (current behavior).
-        MessageBody::EmitSignal { .. } => Operation::SignalEmit { owns_name: true },
-        MessageBody::Register { .. } => Operation::Register { owns_namespace: true },
-        MessageBody::Unregister { .. } => Operation::Unregister { owns_name: true },
+        // A client may emit only as a name it has registered (source is its own
+        // sender label, which must resolve to one of its registrations).
+        MessageBody::EmitSignal { .. } => Operation::SignalEmit { owns_name: owns(sender) },
+        // A name may be claimed on your own lane; on the Highway only the system
+        // (root) may register, so user services live on their lanes.
+        MessageBody::Register { .. } => Operation::Register {
+            owns_namespace: matches!(tier, Tier::Lane { .. })
+                || matches!(principal, Principal::System),
+        },
+        // Unregister requires ownership; a name that is not registered falls
+        // through so the handler returns an accurate "not registered" error.
+        MessageBody::Unregister { name } => Operation::Unregister {
+            owns_name: registry.owner_of(name).is_none() || owns(name),
+        },
 
         MessageBody::StartService { .. }
         | MessageBody::StopService { .. }
@@ -449,6 +472,7 @@ fn classify(body: &MessageBody, tier: Tier) -> Option<Operation> {
 async fn handle_message(
     msg: &Message,
     clients: &ClientWriters,
+    registry: &registry::Registry,
     principal: Principal,
     tier: Tier,
 ) -> HandleResult {
@@ -458,7 +482,7 @@ async fn handle_message(
     // policy::authorize before it is dispatched. This is the single place that
     // grants or denies; the handler arms below assume they are already
     // authorized and never re-check.
-    if let Some(op) = classify(&msg.body, tier) {
+    if let Some(op) = classify(&msg.body, tier, &principal, registry, &msg.sender) {
         match policy::authorize(&principal, tier, &op) {
             Access::Allow => {}
             Access::Deny(reason) => {
@@ -500,15 +524,18 @@ async fn handle_message(
             name,
             socket_path,
             methods,
-        } => match registry::register(name.clone(), socket_path.clone(), methods.clone()) {
-            Ok(()) => ok_reply(id, "Registered"),
-            Err(e) => err_reply(id, e),
-        },
-        MessageBody::Unregister { name } => match registry::unregister(name) {
+        } => {
+            let owner = principal.uid().unwrap_or(0);
+            match registry.register(name.clone(), socket_path.clone(), methods.clone(), owner) {
+                Ok(()) => ok_reply(id, "Registered"),
+                Err(e) => err_reply(id, e),
+            }
+        }
+        MessageBody::Unregister { name } => match registry.unregister(name) {
             Ok(()) => ok_reply(id, "Unregistered"),
             Err(e) => err_reply(id, e),
         },
-        MessageBody::Lookup { name } => match registry::lookup(name) {
+        MessageBody::Lookup { name } => match registry.lookup(name) {
             Some(reg) => reply(
                 id,
                 MessageBody::LookupResult {
@@ -520,26 +547,27 @@ async fn handle_message(
             None => err_reply(id, format!("service '{}' not found on bus", name)),
         },
         MessageBody::ListBus => {
-            let services = registry::list();
+            let services = registry.list();
             reply(id, MessageBody::BusServiceList { services })
         }
 
         // ----- Signals -----
         MessageBody::Subscribe { service, signal } => {
-            match registry::subscribe(&msg.sender, service, signal) {
+            match registry.subscribe(&msg.sender, service, signal) {
                 Ok(()) => ok_reply(id, format!("Subscribed to {}:{}", service, signal)),
                 Err(e) => err_reply(id, e),
             }
         }
         MessageBody::Unsubscribe { service, signal } => {
-            match registry::unsubscribe(&msg.sender, service, signal) {
+            match registry.unsubscribe(&msg.sender, service, signal) {
                 Ok(()) => ok_reply(id, format!("Unsubscribed from {}:{}", service, signal)),
                 Err(e) => err_reply(id, e),
             }
         }
         MessageBody::EmitSignal { signal, payload } => {
-            // Find all subscribers and deliver the signal
-            let subscribers = registry::get_signal_subscribers(&msg.sender, signal);
+            // The choke point verified the sender owns this source name. Deliver
+            // to subscribers of that source.
+            let subscribers = registry.get_signal_subscribers(&msg.sender, signal);
             let delivery = Message {
                 id: next_id(),
                 sender: "rev".to_string(),
