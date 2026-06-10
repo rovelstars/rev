@@ -251,11 +251,52 @@ pub fn start_known_service(name: &str) -> bool {
     services::get_service(name).map(|i| i.is_running).unwrap_or(false)
 }
 
+/// Resolve the (uid, gid) a service should run as from its `user`/`group`
+/// fields. `user` is a numeric uid or a UAC account name; `group` overrides the
+/// gid with a numeric value. Returns None when the user cannot be resolved, so
+/// the caller can refuse to start it rather than fall back to root.
+fn resolve_run_as(user: &str, group: Option<&str>) -> Option<(u32, u32)> {
+    let (uid, mut gid) = match user.parse::<u32>() {
+        Ok(n) => (n, n),
+        Err(_) => match uac_core::Uac::open().and_then(|u| u.get(user)) {
+            Ok(acct) => (acct.uid, acct.gid),
+            Err(e) => {
+                eprintln!("rev: unknown user '{}': {}", user, e);
+                return None;
+            }
+        },
+    };
+    if let Some(g) = group {
+        match g.parse::<u32>() {
+            Ok(n) => gid = n,
+            Err(_) => eprintln!("rev: group must be a numeric gid, got '{}'; using {}", g, gid),
+        }
+    }
+    Some((uid, gid))
+}
+
 /// Fork/exec a service's process from its config, running its start hooks and
 /// recording the child PID. Assumes the service is already registered. Returns
 /// whether the process was launched (false if a pre-hook or the fork failed).
 fn spawn_running(config: &ServiceConfig) -> bool {
     let name = config.name.clone();
+
+    // Resolve the user/group to run as before forking, so UAC is read from the
+    // parent. A service that names a user we cannot resolve is refused rather
+    // than run with rev's own (root) privileges.
+    let run_as = match config.user.as_deref() {
+        None => None,
+        Some(u) => match resolve_run_as(u, config.group.as_deref()) {
+            Some(ids) => Some(ids),
+            None => {
+                eprintln!(
+                    "rev: service {}: cannot resolve user '{}', refusing to start as root",
+                    name, u
+                );
+                return false;
+            }
+        },
+    };
 
     // Run exec-start-pre hook
     if let Some(ref hook) = config.exec_start_pre {
@@ -308,6 +349,25 @@ fn spawn_running(config: &ServiceConfig) -> bool {
                 }
             }
 
+            // Drop privileges to the configured user/group before exec, in the
+            // correct order: supplementary groups, then gid, then uid (once the
+            // uid is dropped we can no longer change groups).
+            if let Some((uid, gid)) = run_as {
+                unsafe {
+                    let grp = [gid as libc::gid_t];
+                    if libc::setgroups(1, grp.as_ptr()) != 0
+                        || libc::setgid(gid as libc::gid_t) != 0
+                        || libc::setuid(uid as libc::uid_t) != 0
+                    {
+                        eprintln!(
+                            "rev: failed to drop privileges to {}:{} for {}",
+                            uid, gid, config.name
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            }
+
             // Parse and execute the command
             use std::ffi::CString;
 
@@ -338,5 +398,20 @@ fn spawn_running(config: &ServiceConfig) -> bool {
             eprintln!("rev: fork failed: {}", e);
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_run_as;
+
+    #[test]
+    fn numeric_user_resolves_without_uac() {
+        // A numeric uid maps uid==gid by default (user-private group).
+        assert_eq!(resolve_run_as("1000", None), Some((1000, 1000)));
+        // A numeric group overrides the gid.
+        assert_eq!(resolve_run_as("1000", Some("2000")), Some((1000, 2000)));
+        // A non-numeric group is ignored (kept as the user's gid), not fatal.
+        assert_eq!(resolve_run_as("1000", Some("staff")), Some((1000, 1000)));
     }
 }

@@ -189,6 +189,15 @@ pub struct ServiceConfig {
     /// present, but their absence or failure is tolerated.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub wants: Vec<String>,
+    /// Run the service process as this user (systemd `User=`): a UAC account
+    /// name or a numeric uid. Default is rev's own uid (root). The group
+    /// defaults to the account's primary group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// Run the service process under this group (systemd `Group=`): a numeric
+    /// gid. Overrides the user's primary group when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_stop: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
