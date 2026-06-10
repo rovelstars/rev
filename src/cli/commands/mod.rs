@@ -38,7 +38,13 @@ pub enum Commands {
     /// dev and benchmark helper: it brings up the bus server on the configured
     /// Highway socket and serves until killed. Hidden from normal help.
     #[command(hide = true)]
-    BusServe,
+    BusServe {
+        /// Mark this session id as the active seat session before serving, so a
+        /// root (System) client can OpenDevice without going through a full
+        /// StartSession. Dev/test only (used by the seat fd-pass VM harness).
+        #[arg(long)]
+        seat_session: Option<u64>,
+    },
 }
 
 pub async fn execute_command(command: Commands) {
@@ -61,9 +67,13 @@ pub async fn execute_command(command: Commands) {
         Commands::Install { file, user } => {
             install::run(&file, user);
         }
-        Commands::BusServe => {
+        Commands::BusServe { seat_session } => {
             let sock = crate::bus::socket_path();
             let sock = sock.to_string_lossy().to_string();
+            if let Some(sid) = seat_session {
+                crate::seat::set_active_session(sid);
+                println!("rev: bus-serve: active seat session = {sid} (dev/test)");
+            }
             println!("rev: bus-serve: System Highway on {sock} (dev/benchmark mode)");
             if let Err(e) =
                 crate::bus::server::run(&sock, crate::bus::policy::Tier::Highway).await
