@@ -97,6 +97,9 @@ struct HandleResult {
     /// the connection can close it under the *same* session on disconnect rather
     /// than guessing the (possibly since-changed) active session.
     device_session: Option<u64>,
+    /// For a successful Register, the name claimed, so the connection can drop it
+    /// from the registry when it disconnects instead of leaving a stale entry.
+    registered: Option<String>,
 }
 
 /// The seat session a principal may act under. The policy has already confirmed
@@ -239,21 +242,26 @@ async fn handle_client(
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Message>(64);
     let mut client_name: Option<String> = None;
 
-    // Track devices opened by this client, each with the session it was opened
-    // under, so disconnect cleanup closes it under the right session even if the
-    // active session has since changed.
+    // Track devices opened, and names registered, by this client, so a
+    // disconnect releases both: devices closed under the session they were
+    // opened on, registrations dropped from the bus so they do not linger.
     let mut opened_devices: Vec<(u64, String)> = Vec::new();
+    let mut registered_names: Vec<String> = Vec::new();
 
-    let cleanup = |name: &Option<String>, devices: &[(u64, String)]| {
-        // Close all devices opened by this client
-        if !devices.is_empty() {
-            for (session_id, path) in devices {
-                let _ = crate::seat::close_device(*session_id, path);
-            }
+    let cleanup_registry = registry.clone();
+    let cleanup = |name: &Option<String>, devices: &[(u64, String)], names: &[String]| {
+        for (session_id, path) in devices {
+            let _ = crate::seat::close_device(*session_id, path);
+        }
+        for n in names {
+            let _ = cleanup_registry.unregister(n);
+        }
+        if !devices.is_empty() || !names.is_empty() {
             println!(
-                "rev: client {:?} disconnected, closed {} devices",
+                "rev: client {:?} disconnected, released {} devices, {} names",
                 name.as_deref().unwrap_or("unknown"),
-                devices.len()
+                devices.len(),
+                names.len()
             );
         }
     };
@@ -268,14 +276,14 @@ async fn handle_client(
                         if let Some(ref name) = client_name {
                             clients.lock().await.remove(name);
                         }
-                        cleanup(&client_name, &opened_devices);
+                        cleanup(&client_name, &opened_devices, &registered_names);
                         return Ok(());
                     }
                     Err(e) => {
                         if let Some(ref name) = client_name {
                             clients.lock().await.remove(name);
                         }
-                        cleanup(&client_name, &opened_devices);
+                        cleanup(&client_name, &opened_devices, &registered_names);
                         return Err(e);
                     }
                 };
@@ -294,6 +302,11 @@ async fn handle_client(
                 };
 
                 let result = handle_message(&msg, &clients, &registry, principal, tier).await;
+
+                // Remember a name this connection registered, to drop on disconnect.
+                if let Some(name) = result.registered.clone() {
+                    registered_names.push(name);
+                }
 
                 // Send the response frame via tokio's async writer.
                 protocol::send_message(&mut writer, &result.response).await?;
@@ -436,7 +449,7 @@ async fn handle_message(
             Access::Allow => {}
             Access::Deny(reason) => {
                 let (response, pass_fd) = err_reply(id, format!("denied: {reason}"));
-                return HandleResult { response, pass_fd, device_session: None };
+                return HandleResult { response, pass_fd, device_session: None, registered: None };
             }
             Access::Elevated(purpose) => {
                 if let Err(e) = crate::auth::verify_for(principal.uid(), msg.auth_token.as_deref(), purpose) {
@@ -445,14 +458,16 @@ async fn handle_message(
                         &format!("{op:?} denied for uid {:?}: {e}", principal.uid()),
                     );
                     let (response, pass_fd) = err_reply(id, format!("denied: {e}"));
-                    return HandleResult { response, pass_fd, device_session: None };
+                    return HandleResult { response, pass_fd, device_session: None, registered: None };
                 }
             }
         }
     }
 
-    // Set by the OpenDevice arm to the session a device was opened under.
+    // Set by the OpenDevice arm to the session a device was opened under, and by
+    // the Register arm to a successfully claimed name.
     let mut device_session: Option<u64> = None;
+    let mut registered: Option<String> = None;
 
     let (response, pass_fd) = match &msg.body {
         // ----- Service management -----
@@ -476,7 +491,10 @@ async fn handle_message(
         } => {
             let owner = principal.uid().unwrap_or(0);
             match registry.register(name.clone(), socket_path.clone(), methods.clone(), owner) {
-                Ok(()) => ok_reply(id, "Registered"),
+                Ok(()) => {
+                    registered = Some(name.clone());
+                    ok_reply(id, "Registered")
+                }
                 Err(e) => err_reply(id, e),
             }
         }
@@ -658,7 +676,7 @@ async fn handle_message(
         _ => err_reply(id, "unexpected message type"),
     };
 
-    HandleResult { response, pass_fd, device_session }
+    HandleResult { response, pass_fd, device_session, registered }
 }
 
 fn handle_start_service(id: u64, name: &str) -> (Message, Option<RawFd>) {
