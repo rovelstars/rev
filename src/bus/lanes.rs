@@ -13,8 +13,14 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::sync::{Arc, Mutex};
+
+use once_cell::sync::Lazy;
+
+/// The process-wide set of active User Lanes. A single instance so the session
+/// handlers (async) and the zombie reaper (a plain thread) can both bring lanes
+/// up and tear them down.
+pub static LANES: Lazy<LaneManager> = Lazy::new(LaneManager::new);
 
 /// Tracks active User Lanes.
 pub struct LaneManager {
@@ -58,13 +64,14 @@ impl LaneManager {
         }
     }
 
-    /// Start a User Lane for the given uid.
-    /// Spawns a WireBus server on the user's lane socket.
-    /// Returns the socket path, or an error if the lane is already active.
-    pub async fn start_lane(&self, uid: u32) -> Result<PathBuf, String> {
-        let mut active = self.active.lock().await;
-        if active.contains_key(&uid) {
-            return Err(format!("user lane for uid {} is already active", uid));
+    /// Start a User Lane for the given uid. Spawns a WireBus server on the
+    /// user's lane socket and returns its path. Idempotent: if the lane is
+    /// already active its existing socket path is returned. Must be called from
+    /// within the tokio runtime (it spawns the lane server task).
+    pub fn start_lane(&self, uid: u32) -> Result<PathBuf, String> {
+        let mut active = self.active.lock().expect("lanes lock poisoned");
+        if let Some(handle) = active.get(&uid) {
+            return Ok(handle.socket_path.clone());
         }
 
         let socket_path = user_lane_path(uid);
@@ -100,9 +107,11 @@ impl LaneManager {
         Ok(socket_path)
     }
 
-    /// Stop a User Lane for the given uid.
-    pub async fn stop_lane(&self, uid: u32) -> Result<(), String> {
-        let mut active = self.active.lock().await;
+    /// Stop a User Lane for the given uid. Sync, so the zombie reaper thread can
+    /// call it on unexpected session exit: it only signals the lane server task
+    /// (running on the runtime) to shut down and removes the socket file.
+    pub fn stop_lane(&self, uid: u32) -> Result<(), String> {
+        let mut active = self.active.lock().expect("lanes lock poisoned");
         match active.remove(&uid) {
             Some(handle) => {
                 let _ = handle.shutdown_tx.send(());
@@ -114,15 +123,15 @@ impl LaneManager {
     }
 
     /// Check if a user lane is active.
-    pub async fn is_active(&self, uid: u32) -> bool {
-        let active = self.active.lock().await;
-        active.contains_key(&uid)
+    pub fn is_active(&self, uid: u32) -> bool {
+        self.active.lock().expect("lanes lock poisoned").contains_key(&uid)
     }
 
     /// List all active user lanes.
-    pub async fn list_lanes(&self) -> Vec<(u32, PathBuf)> {
-        let active = self.active.lock().await;
-        active
+    pub fn list_lanes(&self) -> Vec<(u32, PathBuf)> {
+        self.active
+            .lock()
+            .expect("lanes lock poisoned")
             .iter()
             .map(|(uid, handle)| (*uid, handle.socket_path.clone()))
             .collect()

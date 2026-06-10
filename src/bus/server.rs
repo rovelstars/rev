@@ -678,7 +678,13 @@ async fn handle_message(
             username,
             command,
             env,
-        } => match crate::session::start_session(*uid, *gid, username, command, env) {
+        } => {
+            // Bring the user's Lane bus up before launching the session, so the
+            // session command finds it listening at $WIREBUS_SOCKET.
+            if let Err(e) = crate::bus::lanes::LANES.start_lane(*uid) {
+                eprintln!("rev: could not start lane for uid {}: {}", uid, e);
+            }
+            match crate::session::start_session(*uid, *gid, username, command, env) {
             Ok(session) => {
                 crate::seat::set_active_session(session.session_id);
                 reply(
@@ -691,10 +697,19 @@ async fn handle_message(
                 )
             }
             Err(e) => err_reply(id, e),
-        },
+            }
+        }
         MessageBody::EndSession { session_id } => {
+            // Capture the owner before ending the session removes the record, so
+            // we can tear the user's Lane down afterwards.
+            let owner = crate::session::owner_uid(*session_id);
             match crate::session::end_session(*session_id) {
-                Ok(()) => ok_reply(id, format!("Session {} ended", session_id)),
+                Ok(()) => {
+                    if let Some(uid) = owner {
+                        let _ = crate::bus::lanes::LANES.stop_lane(uid);
+                    }
+                    ok_reply(id, format!("Session {} ended", session_id))
+                }
                 Err(e) => err_reply(id, e),
             }
         }

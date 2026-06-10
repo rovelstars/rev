@@ -348,6 +348,8 @@ pub fn handle_session_exit(pid: u32) {
         if let Some(s) = session {
             println!("rev: session {} for {} exited", id, s.username);
             crate::seat::close_all_devices(id);
+            // The user is gone; tear down their Lane bus too.
+            let _ = crate::bus::lanes::LANES.stop_lane(s.uid);
         }
     }
 }
