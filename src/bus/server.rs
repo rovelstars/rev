@@ -286,25 +286,7 @@ async fn handle_client(
         }
     };
 
-    // Track whether the last request involved synchronous I/O (FD passing).
-    // If so, we need to re-arm tokio's readability interest before the next
-    // recv_message, because the synchronous sendmsg may have caused tokio's
-    // edge-triggered epoll to miss the client's next request arriving.
-    let mut needs_read_rearm = false;
-
     loop {
-        // If the previous iteration did synchronous I/O on the raw fd,
-        // force tokio to re-check readability. Without this, edge-triggered
-        // epoll may have already consumed the EPOLLIN notification while we
-        // were in sendmsg, and recv_message would hang waiting for an edge
-        // that never fires (data is already in the kernel buffer).
-        if needs_read_rearm {
-            // readable() re-registers read interest with the reactor.
-            // If data is already available, it returns immediately.
-            reader.as_ref().readable().await?;
-            needs_read_rearm = false;
-        }
-
         tokio::select! {
             // Incoming request from client
             result = protocol::recv_message(&mut reader) => {
@@ -344,27 +326,22 @@ async fn handle_client(
                 // Send the response frame via tokio's async writer.
                 protocol::send_message(&mut writer, &result.response).await?;
 
-                // If this was an OpenDevice, send the FD via SCM_RIGHTS.
-                // This is synchronous sendmsg on the raw fd — unavoidable
-                // because SCM_RIGHTS requires sendmsg(). Retry on EAGAIN.
+                // If this was an OpenDevice, hand the fd over via SCM_RIGHTS.
+                // SCM_RIGHTS requires sendmsg(); async_io runs it under the
+                // reactor's writability, retrying on EAGAIN, so tokio keeps the
+                // shared fd's readiness coherent and the next recv_message sees
+                // its read edge -- no manual re-arm needed.
                 if let Some(fd) = result.pass_fd {
                     let raw_fd = writer.as_ref().as_raw_fd();
-                    loop {
-                        match crate::seat::fd_passing::send_fd(raw_fd, fd) {
-                            Ok(()) => break,
-                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                writer.as_ref().writable().await?;
-                                continue;
-                            }
-                            Err(e) => return Err(e),
-                        }
-                    }
+                    writer
+                        .as_ref()
+                        .async_io(tokio::io::Interest::WRITABLE, || {
+                            crate::seat::fd_passing::send_fd(raw_fd, fd)
+                        })
+                        .await?;
                     if let (Some(path), Some(sid)) = (device_path, result.device_session) {
                         opened_devices.push((sid, path));
                     }
-                    // Flag that we did sync I/O — next iteration must re-arm
-                    // tokio's read interest before calling recv_message.
-                    needs_read_rearm = true;
                 }
             }
 
