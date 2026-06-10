@@ -71,6 +71,51 @@ fn set_socket_permissions(socket_path: &str) {
     }
 }
 
+/// The primary gid of a uid via UAC, falling back to the uid itself. With a
+/// 0700 socket the group has no access anyway, so this is only cosmetic; we set
+/// it so a lane socket is owned by the user's real group rather than root's.
+fn lane_gid(uid: u32) -> u32 {
+    let Ok(uac) = uac_core::Uac::open() else { return uid };
+    match uac.name_by_uid(uid) {
+        Ok(Some(name)) => uac.get(&name).map(|a| a.gid).unwrap_or(uid),
+        _ => uid,
+    }
+}
+
+/// Lock a user Lane socket (and its directory) to its owner: chown to the user,
+/// chmod 0700. After this the kernel rejects any other user's connect() outright
+/// -- the filesystem is the primary isolation boundary between lanes, with rev's
+/// peer-uid check in handle_client as a backstop. The owning user must already
+/// hold the per-uid directory; rev (root) created it. chown is best-effort
+/// (it fails when rev is not root, e.g. dev builds); the 0700 mode is always set.
+fn set_lane_permissions(socket_path: &str, uid: u32) {
+    use std::ffi::CString;
+    let gid = lane_gid(uid);
+    let mode: libc::mode_t = 0o700;
+
+    let chown_chmod = |path: &str| {
+        if let Ok(c) = CString::new(path) {
+            unsafe {
+                // Ignore chown failure (non-root dev builds); enforce the mode.
+                libc::chown(c.as_ptr(), uid, gid);
+                libc::chmod(c.as_ptr(), mode);
+            }
+        }
+    };
+
+    // The dedicated per-uid directory first, then the socket inside it. We only
+    // touch the parent when it is the lane's own directory (named for the uid);
+    // this skips the flat dev-build layout, where the parent is the cwd. The
+    // grandparent (.../user) stays root-owned so no user can squat a lane path.
+    let path = std::path::Path::new(socket_path);
+    if let Some(parent) = path.parent() {
+        if parent.file_name().map(|n| n.to_string_lossy()) == Some(uid.to_string().into()) {
+            chown_chmod(&parent.to_string_lossy());
+        }
+    }
+    chown_chmod(socket_path);
+}
+
 /// Result of handling a message: the response frame, plus an optional FD
 /// to pass via SCM_RIGHTS immediately after the response (for OpenDevice).
 struct HandleResult {
@@ -151,13 +196,15 @@ pub async fn run(socket_path: &str, tier: Tier) -> std::io::Result<()> {
 
     let listener = UnixListener::bind(socket_path)?;
 
-    // Set socket permissions so unprivileged users can connect.
-    // Mode 0770: owner (root) + group (video/seat) can read/write/connect.
-    // The parent directory should also be group-accessible.
-    //
-    // On RunixOS, the compositor user is expected to be in the "video" group
-    // (or a dedicated "seat" group). The socket group is set accordingly.
-    set_socket_permissions(socket_path);
+    // Lock down the socket. A user Lane is one person's private bus: the socket
+    // and its directory are owned by that user, mode 0700, so the kernel itself
+    // refuses any other user's connect() before rev sees it. The Highway is the
+    // shared system bus (see set_socket_permissions; world access lands in a
+    // later phase, gated by per-method policy).
+    match tier {
+        Tier::Lane { uid } => set_lane_permissions(socket_path, uid),
+        Tier::Highway => set_socket_permissions(socket_path),
+    }
 
     println!("rev: wirebus listening on {}", socket_path);
 
