@@ -184,15 +184,16 @@ fn format_cpu(secs: f64) -> String {
     }
 }
 
-fn build_entry(name: String, info: crate::parser::ServiceInfo) -> ServiceEntry {
-    let uptime = if let Some(ts) = info.up_timestamp {
-        let dur = chrono::Utc::now() - ts;
-        if dur.num_hours() > 0 {
-            format!("{}h {}m", dur.num_hours(), dur.num_minutes() % 60)
-        } else if dur.num_minutes() > 0 {
-            format!("{}m {}s", dur.num_minutes(), dur.num_seconds() % 60)
+fn build_entry(name: String, info: crate::bus::protocol::ServiceSnapshot) -> ServiceEntry {
+    let uptime = if let Some(secs) = info.up_timestamp {
+        let dur = chrono::Utc::now().timestamp() - secs;
+        let dur = dur.max(0);
+        if dur >= 3600 {
+            format!("{}h {}m", dur / 3600, (dur % 3600) / 60)
+        } else if dur >= 60 {
+            format!("{}m {}s", dur / 60, dur % 60)
         } else {
-            format!("{}s", dur.num_seconds())
+            format!("{}s", dur)
         }
     } else {
         "—".into()
@@ -203,13 +204,13 @@ fn build_entry(name: String, info: crate::parser::ServiceInfo) -> ServiceEntry {
     let log_tail = crate::logger::tail_log(&name, 10);
 
     ServiceEntry {
-        description: info.config.description.clone().unwrap_or_default(),
+        description: info.description.clone().unwrap_or_default(),
         name,
         running: info.is_running,
         pid: info.pid,
         uptime,
-        exec: info.config.exec_start.clone(),
-        restart_policy: format!("{:?}", info.config.restart_policy),
+        exec: info.exec_start.clone(),
+        restart_policy: info.restart_policy.clone(),
         memory,
         cpu,
         tasks,
@@ -220,7 +221,8 @@ fn build_entry(name: String, info: crate::parser::ServiceInfo) -> ServiceEntry {
     }
 }
 
-async fn fetch_services() -> std::result::Result<Vec<(String, crate::parser::ServiceInfo)>, String> {
+async fn fetch_services()
+-> std::result::Result<Vec<(String, crate::bus::protocol::ServiceSnapshot)>, String> {
     let socket_path = crate::bus::socket_path();
     let stream = UnixStream::connect(&socket_path)
         .await

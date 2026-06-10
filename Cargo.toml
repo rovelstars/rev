@@ -20,6 +20,8 @@ rmp-serde = "1.3.0"
 rook-core = { path = "../RookGuard/rook-core" }
 rook-elevate = { path = "../RookGuard/rook-elevate" }
 uac-core = { path = "../UAC/uac-core" }
+# WireBus wire protocol, shared with peers (RookGuard) that register on the bus.
+wirebus-proto = { path = "../WireBus/wirebus-proto" }
 serde = { version = "1.0.228", features = ["derive"] }
 shell-words = "1.1.1"
 signal-hook = "0.3.18"

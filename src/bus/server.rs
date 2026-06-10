@@ -475,7 +475,10 @@ async fn handle_message(
         MessageBody::StopService { service } => handle_stop_service(id, service),
         MessageBody::ReloadService { service } => handle_reload_service(id, service),
         MessageBody::ListServices => {
-            let services = crate::init::services::list_services();
+            let services = crate::init::services::list_services()
+                .iter()
+                .map(|(name, info)| (name.clone(), protocol::ServiceSnapshot::from(info)))
+                .collect();
             reply(id, MessageBody::ServiceList { services })
         }
         MessageBody::Rescan => {

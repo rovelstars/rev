@@ -33,11 +33,9 @@ pub mod server;
 
 use std::path::PathBuf;
 
-/// Returns the WireBus socket path for the System Highway.
+/// Returns the WireBus socket path for the System Highway. Delegated to
+/// `wirebus-proto` so rev and every peer that registers on the bus resolve the
+/// rendezvous point through one definition.
 pub fn socket_path() -> PathBuf {
-    if cfg!(debug_assertions) {
-        PathBuf::from("./rev.sock")
-    } else {
-        PathBuf::from("/Transit/Ephemeral/rev/bus.sock")
-    }
+    wirebus_proto::highway_socket()
 }
