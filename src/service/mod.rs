@@ -355,6 +355,21 @@ fn spawn_lane_service(
                     std::env::set_var(key, value);
                 }
             }
+            // Redirect output to a per-user log the user owns (best effort), so a
+            // user service does not write to rev's own console.
+            let log_dir = format!("/Transit/Ephemeral/user/{}/log", uid);
+            let _ = std::fs::create_dir_all(&log_dir);
+            if let Ok(f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(format!("{}/{}.log", log_dir, name))
+            {
+                use std::os::unix::io::AsRawFd;
+                unsafe {
+                    libc::dup2(f.as_raw_fd(), libc::STDOUT_FILENO);
+                    libc::dup2(f.as_raw_fd(), libc::STDERR_FILENO);
+                }
+            }
             if let Some(ref dir) = config.working_dir {
                 let _ = nix::unistd::chdir(dir.as_path());
             }
