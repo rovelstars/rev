@@ -173,6 +173,22 @@ pub struct ServiceConfig {
     /// and waits for it to register the name before answering the Lookup.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provides: Vec<String>,
+    /// Ordering: start this service after the named services (systemd `After=`).
+    /// Pure ordering, no dependency is implied (use `requires`/`wants` for that).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub after: Vec<String>,
+    /// Ordering: start this service before the named services (systemd
+    /// `Before=`). The inverse edge of `after`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub before: Vec<String>,
+    /// Hard dependencies (systemd `Requires=`): pulled in and ordered before this
+    /// service. At boot every service starts anyway, so this also orders them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires: Vec<String>,
+    /// Soft dependencies (systemd `Wants=`): ordered before this service when
+    /// present, but their absence or failure is tolerated.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wants: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_stop: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

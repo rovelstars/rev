@@ -1,5 +1,6 @@
 pub mod console;
 pub mod mounts;
+pub mod ordering;
 pub mod services;
 
 /// Mount the config overlay before anything else.
@@ -78,6 +79,12 @@ pub async fn run(auto_start: bool) {
     let directories = crate::parser::service_dirs();
 
     if auto_start {
+        // Gather every service first so we can start them in dependency order
+        // rather than arbitrary filesystem-walk order. Each entry keeps its
+        // path so we can start it, and its parsed config so we can sort on the
+        // after/before/requires/wants relations.
+        let mut candidates: Vec<(String, crate::parser::ServiceConfig, std::path::PathBuf)> =
+            Vec::new();
         for dir in &directories {
             if !dir.exists() {
                 let _ = std::fs::create_dir_all(dir);
@@ -97,14 +104,33 @@ pub async fn run(auto_start: bool) {
                 };
                 let path = entry.path();
                 if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("rsc") {
-                    let service_name = path
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("unknown");
-                    println!("rev: found service {} at {}", service_name, path.display());
-                    crate::service::start_service_from_path(path);
+                    match std::fs::read_to_string(path)
+                        .ok()
+                        .and_then(|t| crate::parser::deserialize_service_config(&t).ok())
+                    {
+                        Some(config) => {
+                            println!("rev: found service {} at {}", config.name, path.display());
+                            candidates.push((config.name.clone(), config, path.to_path_buf()));
+                        }
+                        None => eprintln!("rev: could not parse {}, skipping", path.display()),
+                    }
                 }
             }
+        }
+
+        let sortable: Vec<(String, crate::parser::ServiceConfig)> = candidates
+            .iter()
+            .map(|(name, config, _)| (name.clone(), config.clone()))
+            .collect();
+        let (order, forced) = ordering::start_order(&sortable);
+        if !forced.is_empty() {
+            eprintln!(
+                "rev: dependency cycle among services {:?}; started in a forced order",
+                forced
+            );
+        }
+        for idx in order {
+            crate::service::start_service_from_path(&candidates[idx].2);
         }
     }
 
