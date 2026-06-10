@@ -297,6 +297,33 @@ pub fn end_session(session_id: u64) -> Result<(), String> {
     Ok(())
 }
 
+/// The uid that owns a session, if it exists. Used by seat arbitration to
+/// confirm a bus peer owns the active session before handing it device fds.
+pub fn owner_uid(session_id: u64) -> Option<u32> {
+    SESSIONS
+        .lock()
+        .expect("sessions lock poisoned")
+        .get(&session_id)
+        .map(|s| s.uid)
+}
+
+/// Register a session record without forking a process. Test-only: lets seat
+/// authorization tests set up an owner mapping.
+#[cfg(test)]
+pub fn register_test_session(session_id: u64, uid: u32) {
+    SESSIONS.lock().expect("sessions lock poisoned").insert(
+        session_id,
+        Session {
+            session_id,
+            uid,
+            gid: uid,
+            username: format!("u{uid}"),
+            pid: 0,
+            lane_socket: PathBuf::from("/tmp/rev-test.sock"),
+        },
+    );
+}
+
 /// List all active sessions.
 pub fn list_sessions() -> Vec<Session> {
     SESSIONS

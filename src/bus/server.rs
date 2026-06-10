@@ -75,6 +75,31 @@ fn set_socket_permissions(socket_path: &str) {
 struct HandleResult {
     response: Message,
     pass_fd: Option<RawFd>,
+    /// For a successful OpenDevice, the session the device was opened under, so
+    /// the connection can close it under the *same* session on disconnect rather
+    /// than guessing the (possibly since-changed) active session.
+    device_session: Option<u64>,
+}
+
+/// Authorize a seat (device-arbitration) request from `peer_uid` and return the
+/// session id it may act on. Only the owner of the *active* seat session -- or
+/// root, a trusted system component -- may open or close the input/display
+/// device fds. This is the check that keeps a background or cross-user process
+/// from grabbing the foreground session's keyboard and screen; without it, any
+/// process that can reach the bus could pull a DRM/input fd and keylog or
+/// screen-grab the logged-in user. Fails closed.
+fn authorize_seat(peer_uid: Option<u32>) -> Result<u64, String> {
+    let peer = peer_uid.ok_or_else(|| "no peer identity on the connection".to_string())?;
+    let active = crate::seat::active_session()
+        .ok_or_else(|| "no active seat session to act on".to_string())?;
+    if peer == 0 {
+        return Ok(active);
+    }
+    match crate::session::owner_uid(active) {
+        Some(owner) if owner == peer => Ok(active),
+        Some(_) => Err(format!("uid {peer} does not own the active seat session")),
+        None => Err("active seat session has no owner record".to_string()),
+    }
 }
 
 static NEXT_MSG_ID: AtomicU64 = AtomicU64::new(1);
@@ -179,15 +204,16 @@ async fn handle_client(
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Message>(64);
     let mut client_name: Option<String> = None;
 
-    // Track devices opened by this client for cleanup on disconnect.
-    let mut opened_devices: Vec<String> = Vec::new();
+    // Track devices opened by this client, each with the session it was opened
+    // under, so disconnect cleanup closes it under the right session even if the
+    // active session has since changed.
+    let mut opened_devices: Vec<(u64, String)> = Vec::new();
 
-    let cleanup = |name: &Option<String>, devices: &[String]| {
+    let cleanup = |name: &Option<String>, devices: &[(u64, String)]| {
         // Close all devices opened by this client
         if !devices.is_empty() {
-            let session_id = crate::seat::active_session().unwrap_or(0);
-            for path in devices {
-                let _ = crate::seat::close_device(session_id, path);
+            for (session_id, path) in devices {
+                let _ = crate::seat::close_device(*session_id, path);
             }
             println!(
                 "rev: client {:?} disconnected, closed {} devices",
@@ -270,8 +296,8 @@ async fn handle_client(
                             Err(e) => return Err(e),
                         }
                     }
-                    if let Some(path) = device_path {
-                        opened_devices.push(path);
+                    if let (Some(path), Some(sid)) = (device_path, result.device_session) {
+                        opened_devices.push((sid, path));
                     }
                     // Flag that we did sync I/O — next iteration must re-arm
                     // tokio's read interest before calling recv_message.
@@ -297,6 +323,9 @@ async fn handle_message(msg: &Message, clients: &ClientWriters, peer_uid: Option
     //   - Register on System Highway
     //   - Cross-lane access (User Lane -> System Highway)
     //   - Starting/stopping system services (non-user)
+
+    // Set by the OpenDevice arm to the session a device was opened under.
+    let mut device_session: Option<u64> = None;
 
     let (response, pass_fd) = match &msg.body {
         // ----- Service management -----
@@ -390,29 +419,33 @@ async fn handle_message(msg: &Message, clients: &ClientWriters, peer_uid: Option
 
         // ----- Seat (device arbitration) -----
         MessageBody::OpenDevice { path } => {
-            // TODO: validate that the requesting session owns the active seat
-            // For now, allow any connected client to open devices.
-            // In production, this must check session ownership + Rook Guard auth.
-            let session_id = crate::seat::active_session().unwrap_or(0);
-            match crate::seat::open_device(session_id, path) {
-                Ok(fd) => {
-                    // Return the Ok response AND the FD to pass.
-                    // handle_client writes the response frame first, then
-                    // sends the raw FD via SCM_RIGHTS immediately after.
-                    // The client reads the Ok, then calls recv_fd().
-                    let response = make_msg(id, MessageBody::Ok {
-                        message: format!("Opened device: {}", path),
-                    });
-                    (response, Some(fd))
-                }
-                Err(e) => err_reply(id, e),
+            // Only the owner of the active seat session (or root) may pull a
+            // device fd. authorize_seat fails closed for everyone else.
+            match authorize_seat(peer_uid) {
+                Ok(session_id) => match crate::seat::open_device(session_id, path) {
+                    Ok(fd) => {
+                        // Return the Ok response AND the FD to pass.
+                        // handle_client writes the response frame first, then
+                        // sends the raw FD via SCM_RIGHTS immediately after.
+                        // The client reads the Ok, then calls recv_fd().
+                        device_session = Some(session_id);
+                        let response = make_msg(id, MessageBody::Ok {
+                            message: format!("Opened device: {}", path),
+                        });
+                        (response, Some(fd))
+                    }
+                    Err(e) => err_reply(id, e),
+                },
+                Err(e) => err_reply(id, format!("OpenDevice denied: {e}")),
             }
         }
         MessageBody::CloseDevice { path } => {
-            let session_id = crate::seat::active_session().unwrap_or(0);
-            match crate::seat::close_device(session_id, path) {
-                Ok(()) => ok_reply(id, format!("Closed device: {}", path)),
-                Err(e) => err_reply(id, e),
+            match authorize_seat(peer_uid) {
+                Ok(session_id) => match crate::seat::close_device(session_id, path) {
+                    Ok(()) => ok_reply(id, format!("Closed device: {}", path)),
+                    Err(e) => err_reply(id, e),
+                },
+                Err(e) => err_reply(id, format!("CloseDevice denied: {e}")),
             }
         }
         // PauseDevice and ResumeDevice are server->client only
@@ -513,7 +546,7 @@ async fn handle_message(msg: &Message, clients: &ClientWriters, peer_uid: Option
         _ => err_reply(id, "unexpected message type"),
     };
 
-    HandleResult { response, pass_fd }
+    HandleResult { response, pass_fd, device_session }
 }
 
 fn handle_start_service(id: u64, name: &str) -> (Message, Option<RawFd>) {
@@ -654,4 +687,31 @@ fn rescan_services() -> u32 {
         }
     }
     found
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seat_authorization() {
+        // A unique active session id for this test so it does not collide with
+        // any other test touching the shared seat/session state.
+        let sid = 90_001u64;
+        let owner = 50_001u32;
+        let other = 50_002u32;
+
+        crate::session::register_test_session(sid, owner);
+        crate::seat::set_active_session(sid);
+
+        // Owner of the active session: authorized, gets that session id.
+        assert_eq!(authorize_seat(Some(owner)).unwrap(), sid);
+        // Root (a system component): authorized.
+        assert_eq!(authorize_seat(Some(0)).unwrap(), sid);
+        // A different local user: denied -- this is the cross-user device-fd
+        // theft the gate exists to stop.
+        assert!(authorize_seat(Some(other)).is_err());
+        // No peer identity on the connection: denied (fail closed).
+        assert!(authorize_seat(None).is_err());
+    }
 }

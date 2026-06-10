@@ -49,29 +49,34 @@ const ALLOWED_PREFIXES: &[&str] = &[
     "/dev/input/",
 ];
 
-/// Validate that a device path is allowed to be opened.
-fn is_allowed_device(path: &str) -> bool {
-    let canon = match std::fs::canonicalize(path) {
-        Ok(p) => p,
-        Err(_) => return false,
-    };
+/// Resolve `path` to its real location and confirm it is an allowed device
+/// node, returning the canonical path. Returns None if it resolves outside the
+/// allowlist (e.g. a `..` escape or a symlink to /dev/mem). We open this
+/// canonical path rather than the caller's string so the check and the open
+/// cannot disagree across a symlink swap (TOCTOU).
+fn allowed_device_path(path: &str) -> Option<PathBuf> {
+    let canon = std::fs::canonicalize(path).ok()?;
     let canon_str = canon.to_string_lossy();
-    ALLOWED_PREFIXES.iter().any(|prefix| canon_str.starts_with(prefix))
+    if ALLOWED_PREFIXES.iter().any(|prefix| canon_str.starts_with(prefix)) {
+        Some(canon)
+    } else {
+        None
+    }
 }
 
 /// Open a device node and return its file descriptor.
 /// Only works for allowed device paths.
 pub fn open_device(session_id: u64, path: &str) -> Result<RawFd, String> {
-    if !is_allowed_device(path) {
-        return Err(format!(
+    let canon = allowed_device_path(path).ok_or_else(|| {
+        format!(
             "device '{}' is not in the allowed list (only /dev/dri/* and /dev/input/*)",
             path
-        ));
-    }
+        )
+    })?;
 
     let fd = unsafe {
         libc::open(
-            std::ffi::CString::new(path)
+            std::ffi::CString::new(canon.as_os_str().as_encoded_bytes())
                 .map_err(|_| "invalid device path")?
                 .as_ptr(),
             libc::O_RDWR | libc::O_CLOEXEC,
