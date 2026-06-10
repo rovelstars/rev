@@ -26,6 +26,7 @@
 //! subscribers and emitters agree on format out-of-band.
 
 pub mod lanes;
+pub mod policy;
 pub mod protocol;
 pub mod registry;
 pub mod server;
