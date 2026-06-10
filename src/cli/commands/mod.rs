@@ -1,5 +1,6 @@
 mod create;
 mod read;
+mod service_client;
 mod start;
 mod stop;
 
