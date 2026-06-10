@@ -1564,6 +1564,7 @@ dependencies = [
  "ratatui",
  "rmp-serde",
  "rook-core",
+ "rook-elevate",
  "serde",
  "shell-words",
  "signal-hook",
@@ -1607,6 +1608,15 @@ dependencies = [
  "rand",
  "rmp-serde",
  "serde",
+]
+
+[[package]]
+name = "rook-elevate"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rook-core",
+ "uac-core",
 ]
 
 [[package]]
