@@ -855,4 +855,56 @@ mod tests {
         // No peer credential: Anonymous, denied everything by the policy.
         assert_eq!(resolve_principal(None), Principal::Anonymous);
     }
+
+    // End-to-end: a peer registers a name through the blocking sync client (the
+    // path rookd/rexecd use to announce themselves) and a second connection looks
+    // it up, exercising the real server, registry, and wire codec. Run on a Lane
+    // for this uid because a Lane lets its owner claim a name; Highway
+    // registration is root-only and is covered by the policy unit tests.
+    #[tokio::test]
+    async fn register_and_lookup_roundtrip_over_sync_client() {
+        use std::path::PathBuf;
+        use std::time::Duration;
+
+        let uid = nix::unistd::getuid().as_raw();
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("bus.sock");
+        let sock_str = sock.to_string_lossy().to_string();
+
+        let server_sock = sock_str.clone();
+        tokio::spawn(async move {
+            let _ = run(&server_sock, Tier::Lane { uid }).await;
+        });
+        for _ in 0..200 {
+            if sock.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let target = PathBuf::from("/Transit/Ephemeral/RookGuard/rookd.sock");
+        let target_for_blk = target.clone();
+        let looked = tokio::task::spawn_blocking(move || {
+            // Point the sync helpers at this bus. No other test reads
+            // REV_BUS_SOCK, so this process-global override is safe here.
+            unsafe {
+                std::env::set_var("REV_BUS_SOCK", &sock_str);
+            }
+            let _held = wirebus_proto::sync::register(
+                "rookguard",
+                &target_for_blk,
+                std::collections::HashMap::new(),
+            )
+            .expect("register on the bus");
+            // The registration is held by `_held`; rev drops a peer's names when
+            // its connection closes, so the lookup must happen before the drop.
+            let found = wirebus_proto::sync::lookup("rookguard").expect("lookup transport ok");
+            drop(_held);
+            found
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(looked, Some(target));
+    }
 }

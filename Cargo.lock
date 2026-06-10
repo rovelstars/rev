@@ -1609,6 +1609,7 @@ dependencies = [
  "rand",
  "rmp-serde",
  "serde",
+ "wirebus-proto",
 ]
 
 [[package]]
