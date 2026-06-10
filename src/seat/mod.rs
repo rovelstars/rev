@@ -49,6 +49,26 @@ const ALLOWED_PREFIXES: &[&str] = &[
     "/dev/input/",
 ];
 
+// DRM master ioctls (asm-generic _IO encoding, type 'd' = 0x64). Becoming DRM
+// master is what lets the fd holder modeset. Modern kernels do NOT auto-grant
+// master on first open, and SET_MASTER requires CAP_SYS_ADMIN -- which Rev has
+// (it is root) but an unprivileged compositor does not. So Rev must become
+// master here, while it holds the fd, before passing it on: master lives on the
+// open file description and rides the SCM_RIGHTS pass to the compositor, which
+// can then drive KMS without any privilege of its own. Validated end to end in
+// a virtio-gpu VM (see Rignite/seat-fdpass-smoke).
+const DRM_IOCTL_SET_MASTER: libc::c_ulong = 0x0000_641e;
+const DRM_IOCTL_DROP_MASTER: libc::c_ulong = 0x0000_641f;
+
+/// True for a DRM primary node (/dev/dri/card*), which is the one that carries
+/// modeset/master rights. Render nodes (/dev/dri/renderD*) never need master.
+fn is_drm_primary(path: &std::path::Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.starts_with("card"))
+        .unwrap_or(false)
+}
+
 /// Resolve `path` to its real location and confirm it is an allowed device
 /// node, returning the canonical path. Returns None if it resolves outside the
 /// allowlist (e.g. a `..` escape or a symlink to /dev/mem). We open this
@@ -91,6 +111,23 @@ pub fn open_device(session_id: u64, path: &str) -> Result<RawFd, String> {
         ));
     }
 
+    // For a primary DRM node, become master now (Rev is root) so the modeset
+    // authority rides the fd to the unprivileged compositor. Non-fatal: a setup
+    // that auto-grants master returns EINVAL/EBUSY here and still works.
+    if is_drm_primary(&canon) {
+        let r = unsafe { libc::ioctl(fd, DRM_IOCTL_SET_MASTER, 0) };
+        if r != 0 {
+            crate::logger::write_log(
+                "rev",
+                &format!(
+                    "seat: SET_MASTER on {} failed: {} (continuing; compositor may not be able to modeset)",
+                    path,
+                    std::io::Error::last_os_error()
+                ),
+            );
+        }
+    }
+
     // Track the FD
     let mut state = STATE.lock().expect("seat state lock poisoned");
     state
@@ -127,6 +164,32 @@ pub fn close_all_devices(session_id: u64) {
     if let Some(devices) = state.session_devices.remove(&session_id) {
         for dev in devices {
             unsafe { libc::close(dev.fd); }
+        }
+    }
+}
+
+/// Drop DRM master on all of a session's primary nodes. Called on VT switch
+/// away (alongside PauseDevice) so the incoming session can become master.
+#[allow(dead_code)] // wired in with the VT-switch pause/resume path
+pub fn drop_master(session_id: u64) {
+    master_ioctl_for_session(session_id, DRM_IOCTL_DROP_MASTER);
+}
+
+/// Reacquire DRM master on all of a session's primary nodes. Called on VT
+/// switch back (alongside ResumeDevice).
+#[allow(dead_code)] // wired in with the VT-switch pause/resume path
+pub fn set_master(session_id: u64) {
+    master_ioctl_for_session(session_id, DRM_IOCTL_SET_MASTER);
+}
+
+#[allow(dead_code)]
+fn master_ioctl_for_session(session_id: u64, req: libc::c_ulong) {
+    let state = STATE.lock().expect("seat state lock poisoned");
+    if let Some(devices) = state.session_devices.get(&session_id) {
+        for dev in devices {
+            if is_drm_primary(&dev.path) {
+                unsafe { libc::ioctl(dev.fd, req, 0) };
+            }
         }
     }
 }
