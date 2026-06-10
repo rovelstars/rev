@@ -25,6 +25,7 @@
 //! Rev delivers to all connected subscribers. Payload is opaque bytes —
 //! subscribers and emitters agree on format out-of-band.
 
+pub mod activation;
 pub mod lanes;
 pub mod policy;
 pub mod protocol;

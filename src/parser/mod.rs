@@ -168,6 +168,11 @@ pub struct ServiceConfig {
     pub working_dir: Option<PathBuf>,
     #[serde(default)]
     pub restart_policy: RestartPolicy,
+    /// WireBus names this service provides. When a Lookup for one of these
+    /// names misses on the Highway, rev starts this service (bus-activation)
+    /// and waits for it to register the name before answering the Lookup.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provides: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_stop: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

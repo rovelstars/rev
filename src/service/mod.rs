@@ -227,12 +227,41 @@ pub fn start_service_from_path(path: &std::path::Path) {
         },
     );
 
+    // Undo the registration if the service cannot actually be started, so a
+    // failed start does not leave a phantom registered-but-dead entry.
+    if !spawn_running(&config) {
+        services::deregister_service(&name);
+    }
+}
+
+/// Start a service rev already knows (loaded from a .rsc file) but that is not
+/// running, returning whether it is now running. Used by bus-activation, where
+/// a Lookup for a name a service `provides` arrives while that service is idle.
+/// Unlike `start_service_from_path`, the service must already be registered (it
+/// is left registered on failure, since rev knows it independently of the bus).
+pub fn start_known_service(name: &str) -> bool {
+    let info = match services::get_service(name) {
+        Some(i) => i,
+        None => return false,
+    };
+    if info.is_running {
+        return true;
+    }
+    spawn_running(&info.config);
+    services::get_service(name).map(|i| i.is_running).unwrap_or(false)
+}
+
+/// Fork/exec a service's process from its config, running its start hooks and
+/// recording the child PID. Assumes the service is already registered. Returns
+/// whether the process was launched (false if a pre-hook or the fork failed).
+fn spawn_running(config: &ServiceConfig) -> bool {
+    let name = config.name.clone();
+
     // Run exec-start-pre hook
     if let Some(ref hook) = config.exec_start_pre {
-        if !run_hook(hook, &config) {
+        if !run_hook(hook, config) {
             eprintln!("rev: exec-start-pre failed for {}, aborting start", name);
-            services::deregister_service(&name);
-            return;
+            return false;
         }
     }
 
@@ -246,8 +275,9 @@ pub fn start_service_from_path(path: &std::path::Path) {
 
             // Run exec-start-post hook
             if let Some(ref hook) = config.exec_start_post {
-                run_hook(hook, &config);
+                run_hook(hook, config);
             }
+            true
         }
         #[allow(unreachable_code)]
         Ok(nix::unistd::ForkResult::Child) => {
@@ -302,10 +332,11 @@ pub fn start_service_from_path(path: &std::path::Path) {
             let args_ref: Vec<&std::ffi::CStr> = args_cstr.iter().map(|s| s.as_c_str()).collect();
 
             nix::unistd::execv(&exec_path, &args_ref).expect("execv failed");
-            unreachable!();
+            unreachable!()
         }
         Err(e) => {
             eprintln!("rev: fork failed: {}", e);
+            false
         }
     }
 }

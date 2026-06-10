@@ -541,17 +541,25 @@ async fn handle_message(
             Ok(()) => ok_reply(id, "Unregistered"),
             Err(e) => err_reply(id, e),
         },
-        MessageBody::Lookup { name } => match registry.lookup(name) {
-            Some(reg) => reply(
-                id,
-                MessageBody::LookupResult {
-                    name: reg.name,
-                    socket_path: reg.socket_path,
-                    methods: reg.methods,
-                },
-            ),
-            None => err_reply(id, format!("service '{}' not found on bus", name)),
-        },
+        MessageBody::Lookup { name } => {
+            // On a miss on the Highway, try to bus-activate a service that
+            // declares it provides this name, then look up once more. Lanes
+            // carry only their own user's services and are not activatable.
+            if registry.lookup(name).is_none() && matches!(tier, Tier::Highway) {
+                let _ = crate::bus::activation::activate(name, registry).await;
+            }
+            match registry.lookup(name) {
+                Some(reg) => reply(
+                    id,
+                    MessageBody::LookupResult {
+                        name: reg.name,
+                        socket_path: reg.socket_path,
+                        methods: reg.methods,
+                    },
+                ),
+                None => err_reply(id, format!("service '{}' not found on bus", name)),
+            }
+        }
         MessageBody::ListBus => {
             let services = registry.list();
             reply(id, MessageBody::BusServiceList { services })
