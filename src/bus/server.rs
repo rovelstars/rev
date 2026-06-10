@@ -16,57 +16,29 @@ use super::policy::{self, Access, Operation, Principal, Scope, Tier};
 use super::protocol::{self, Message, MessageBody};
 use super::registry;
 
-/// Set socket file permissions so unprivileged compositors can connect.
+/// Make the System Highway socket reachable by any local process.
 ///
-/// The socket is set to mode 0770 (rwxrwx---) so root and the socket's
-/// group can connect. The group is set to "video" — compositors should
-/// run with this supplementary group.
-///
-/// If the "video" group doesn't exist (e.g. debug builds), falls back
-/// to mode 0777 so any user can connect during development.
+/// The Highway is world-connectable by design: a normal user's compositor must
+/// reach it for seat/session, and every request is individually authorized by
+/// the policy (peer-credential principal + capability tokens), so connectivity
+/// grants nothing on its own. This replaces the earlier root:video 0770 gate,
+/// which was an incidental hack from the Epiclese bring-up and only ever a
+/// coarse stand-in for the per-method checks now in place. The socket is mode
+/// 0666 (connect needs read+write) and its directory 0755 so the path is
+/// traversable; both stay root-owned so no user can replace them.
 fn set_socket_permissions(socket_path: &str) {
     use std::ffi::CString;
 
-    let c_path = match CString::new(socket_path) {
-        Ok(p) => p,
-        Err(_) => return,
-    };
-
-    if cfg!(debug_assertions) {
-        // Debug mode: world-accessible so any user can connect without
-        // needing group membership. Safe for development only.
-        unsafe {
-            libc::chmod(c_path.as_ptr(), 0o777);
-        }
-        return;
+    let Ok(c_path) = CString::new(socket_path) else { return };
+    unsafe {
+        libc::chmod(c_path.as_ptr(), 0o666);
     }
-
-    // Production: socket is root:video 0770 — compositors need the video
-    // group (or a dedicated "seat" group) to connect.
-    let group_name = CString::new("video").unwrap();
-    let grp = unsafe { libc::getgrnam(group_name.as_ptr()) };
-
-    if !grp.is_null() {
-        let gid = unsafe { (*grp).gr_gid };
-        unsafe {
-            libc::chown(c_path.as_ptr(), 0, gid);
-            libc::chmod(c_path.as_ptr(), 0o770);
-        }
-        if let Some(parent) = std::path::Path::new(socket_path).parent() {
-            if let Ok(parent_c) = CString::new(parent.to_string_lossy().as_bytes()) {
-                unsafe {
-                    libc::chown(parent_c.as_ptr(), 0, gid);
-                    libc::chmod(parent_c.as_ptr(), 0o770);
-                }
+    if let Some(parent) = std::path::Path::new(socket_path).parent() {
+        if let Ok(parent_c) = CString::new(parent.to_string_lossy().as_bytes()) {
+            unsafe {
+                libc::chown(parent_c.as_ptr(), 0, 0);
+                libc::chmod(parent_c.as_ptr(), 0o755);
             }
-        }
-    } else {
-        eprintln!(
-            "rev: WARNING: 'video' group not found, socket at {} may not be accessible",
-            socket_path
-        );
-        unsafe {
-            libc::chmod(c_path.as_ptr(), 0o770);
         }
     }
 }
@@ -199,8 +171,8 @@ pub async fn run(socket_path: &str, tier: Tier) -> std::io::Result<()> {
     // Lock down the socket. A user Lane is one person's private bus: the socket
     // and its directory are owned by that user, mode 0700, so the kernel itself
     // refuses any other user's connect() before rev sees it. The Highway is the
-    // shared system bus (see set_socket_permissions; world access lands in a
-    // later phase, gated by per-method policy).
+    // shared system bus: world-connectable, with every request authorized
+    // per-method by the policy (see set_socket_permissions).
     match tier {
         Tier::Lane { uid } => set_lane_permissions(socket_path, uid),
         Tier::Highway => set_socket_permissions(socket_path),
@@ -662,9 +634,15 @@ async fn handle_message(
             }
         }
         MessageBody::ListSessions => {
+            // Enumerating other users' sessions is cross-scope: the system sees
+            // all, a user sees only their own. This keeps the Highway being
+            // world-connectable from leaking who else is logged in.
+            let all = matches!(principal, Principal::System);
+            let viewer = principal.uid();
             let sessions = crate::session::list_sessions();
             let entries: Vec<protocol::SessionEntry> = sessions
                 .iter()
+                .filter(|s| all || Some(s.uid) == viewer)
                 .map(|s| protocol::SessionEntry {
                     session_id: s.session_id,
                     uid: s.uid,
