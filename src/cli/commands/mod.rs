@@ -24,6 +24,11 @@ pub enum Commands {
     Stop {
         service_name: String,
     },
+    /// Run only the WireBus System Highway, without any init behaviour. A
+    /// dev and benchmark helper: it brings up the bus server on the configured
+    /// Highway socket and serves until killed. Hidden from normal help.
+    #[command(hide = true)]
+    BusServe,
 }
 
 pub async fn execute_command(command: Commands) {
@@ -42,6 +47,16 @@ pub async fn execute_command(command: Commands) {
         }
         Commands::Stop { service_name } => {
             stop::run(&service_name).await;
+        }
+        Commands::BusServe => {
+            let sock = crate::bus::socket_path();
+            let sock = sock.to_string_lossy().to_string();
+            println!("rev: bus-serve: System Highway on {sock} (dev/benchmark mode)");
+            if let Err(e) =
+                crate::bus::server::run(&sock, crate::bus::policy::Tier::Highway).await
+            {
+                eprintln!("rev: bus-serve: {e}");
+            }
         }
     }
 }

@@ -24,12 +24,28 @@ doing that ourselves.
 
 ## Prerequisites
 
-- `hyperfine` installed (`cargo install hyperfine`, or from distro)
-- `rev` built and running. These benchmarks connect to rev's System
-  Highway at `$REV_SOCK` (default `./rev.sock`, matching rev's debug
-  build). Start rev in another terminal: `cargo run --bin rev` from
-  `../../`.
+- `hyperfine` installed (`cargo install hyperfine`, or from distro). Optional:
+  every bench also prints its own per-op latency to stderr, so you can read
+  numbers without hyperfine (see "Sanity" below).
+- `rev` built and a System Highway running. These benchmarks resolve the
+  Highway through `wirebus_proto::highway_socket()` (env `REV_BUS_SOCK`, else
+  rev's default). Start a bus-only server (no init behaviour) in another
+  terminal:
+
+  ```
+  REV_BUS_SOCK=/tmp/rev-bench-bus.sock cargo run --release --bin rev -- bus-serve
+  ```
+
+- For the peer-to-peer bench, also start the echo peer:
+
+  ```
+  BENCH_ECHO_SOCK=/tmp/rev-bench-echo.sock ./target/release/bench-echo-server
+  ```
+
 - DBus session bus available (any normal desktop session has one).
+
+Export the same `REV_BUS_SOCK` (and `BENCH_ECHO_SOCK`) in the shell that runs
+the bench binaries so they reach the server you started.
 
 Build the benchmarks once, in release mode — LTO + single codegen unit
 matter when you're looking at sub-microsecond syscall paths:
@@ -58,6 +74,21 @@ hyperfine --warmup 3 --runs 10 \
 
 Each binary also prints its own per-op latency to stderr, which is
 useful as a cross-check against hyperfine's wall-clock mean.
+
+### Peer-to-peer round-trip
+
+This is how WireBus actually carries method calls: a client looks a service up
+on the Highway once, then connects to the service's own socket and talks to it
+directly, with rev out of the data path. `bench-wirebus-p2p-rtt` measures that
+steady-state direct round-trip against `bench-echo-server`. Its fair DBus
+counterpart is `bench-dbus-rtt`, because every DBus call is relayed by the
+dbus-daemon, so DBus has no "broker out of the path" mode to compare.
+
+```
+hyperfine --warmup 3 --runs 10 \
+    'target/release/bench-wirebus-p2p-rtt 10000' \
+    'target/release/bench-dbus-rtt 10000'
+```
 
 ### Connection setup cost
 
@@ -113,10 +144,35 @@ the socket path mismatch).
 
 | Operation | Bench | Fair? | Notes |
 |-----------|-------|-------|-------|
-| Empty round-trip | `wirebus-rtt` vs `dbus-rtt` | ✅ | Both hit the broker, not a user service. |
-| Connection setup | `wirebus-connect` vs `dbus-connect` | ✅ | DBus does auth; rev does not. Gap expected. |
-| FD passing | *todo* | — | `OpenDevice` vs `systemd-logind.TakeDevice`. |
-| Service start | *todo* | — | `rev start X` vs `systemctl start X`. |
+| Broker round-trip | `wirebus-rtt` vs `dbus-rtt` | yes | Both hit the broker, not a user service. |
+| Peer-to-peer round-trip | `wirebus-p2p-rtt` vs `dbus-rtt` | yes | WireBus talks to the service direct; DBus always relays via the daemon. |
+| Connection setup | `wirebus-connect` vs `dbus-connect` | yes | DBus does SASL auth; rev does not. Gap expected. |
+| FD passing | *todo* | - | `OpenDevice` vs `systemd-logind.TakeDevice`. |
+| Service start | *todo* | - | `rev start X` vs `systemctl start X`. |
+
+## Measured results
+
+One reference run, so the orders of magnitude are on record. Reproduce with the
+commands above; absolute numbers move with hardware and load, the ratios less
+so. Machine: this dev box, `--release`, N=50000, three runs each (RTT) reading
+the stderr per-op line; not pinned to a CPU.
+
+| Bench | Per-op | Throughput |
+|-------|--------|-----------|
+| `wirebus-rtt` (broker) | ~5.1 us | ~195k op/s |
+| `wirebus-p2p-rtt` (direct) | ~4.5 us | ~215k op/s |
+| `dbus-rtt` (Peer.Ping via daemon) | ~15.3 us | ~65k op/s |
+| `wirebus-connect` | ~17.5 us | ~57k op/s |
+| `dbus-connect` | ~83.2 us | ~12k op/s |
+
+Reading it: WireBus round-trips land about 3x faster than DBus and connect
+about 4.8x faster (DBus pays a SASL + Hello handshake per connection). The
+peer-to-peer path edges out the broker path because rev leaves the data path,
+though only slightly here: `ListBus` on an empty registry is cheap, so rev's
+per-call dispatch is small. The p2p advantage widens under contention, where a
+central broker serialises unrelated callers and direct sockets do not. Keep the
+scope caveat in mind: DBus also does introspection, typed signatures, and policy
+that WireBus does not, so these are latency numbers, not a feature verdict.
 
 ## Adding a bench
 
