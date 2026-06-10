@@ -8,7 +8,8 @@
 //! it opens UAC, loads rookd's public key, owns the process's single-use nonce
 //! cache, and maps errors to the strings rev's bus replies with.
 
-use rook_elevate::{authorize, now, rookd_pubkey, NonceCache};
+use rook_core::policy::Purpose;
+use rook_elevate::{authorize_for, now, rookd_pubkey, NonceCache};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use uac_core::Uac;
@@ -32,10 +33,15 @@ fn pubkey() -> Result<[u8; 32], String> {
 /// name. Delegates to the shared `rook-elevate` policy: root by credentials,
 /// everyone else by a single-use ElevateRoot token bound to their own uid and
 /// UAC admin status.
-pub fn authorize_elevation(peer_uid: Option<u32>, auth_token: Option<&str>) -> Result<String, String> {
+/// Verify a RookGuard capability token for an arbitrary `purpose`, bound to the
+/// connecting peer. Used by the bus authorization choke point when the policy
+/// returns `Elevated(purpose)` (ElevateRoot for ExecAs, SystemServiceControl for
+/// cross-scope service administration). Returns the authorized caller name.
+pub fn verify_for(peer_uid: Option<u32>, auth_token: Option<&str>, purpose: Purpose) -> Result<String, String> {
     let uac = Uac::open().map_err(|e| format!("open UAC: {e}"))?;
     let pubkey = pubkey()?;
-    authorize(&uac, &pubkey, peer_uid, auth_token, now(), nonces()).map_err(|e| format!("{e:#}"))
+    authorize_for(&uac, &pubkey, peer_uid, auth_token, now(), nonces(), purpose)
+        .map_err(|e| format!("{e:#}"))
 }
 
 /// Resolve a target uid to its name/gid/home/shell through UAC, instead of
@@ -87,30 +93,32 @@ mod tests {
         let kp = Keypair::generate();
         std::fs::write(keyd.join("rookd.pub"), kp.public_bytes()).unwrap();
 
+        let elevate = |peer, tok: Option<&str>| verify_for(peer, tok, Purpose::ElevateRoot);
+
         // root peer: trusted by credentials, no token needed.
-        assert_eq!(authorize_elevation(Some(0), None).unwrap(), "root");
+        assert_eq!(elevate(Some(0), None).unwrap(), "root");
         // no peer identity at all: refused.
-        assert!(authorize_elevation(None, None).is_err());
+        assert!(elevate(None, None).is_err());
         // admin with a valid token bound to its own uid: authorized.
         let t = token_for(&kp, "boss", 4242, 120);
-        assert_eq!(authorize_elevation(Some(4242), Some(&t)).unwrap(), "boss");
+        assert_eq!(elevate(Some(4242), Some(&t)).unwrap(), "boss");
         // the same token a second time: refused (single-use, now enforced on the
         // rev path too, not only rexecd).
-        assert!(authorize_elevation(Some(4242), Some(&t)).is_err());
+        assert!(elevate(Some(4242), Some(&t)).is_err());
         // same admin, no token: refused (fail closed).
-        assert!(authorize_elevation(Some(4242), None).is_err());
+        assert!(elevate(Some(4242), None).is_err());
         // token presented by a different uid (audience mismatch): refused.
         let t2 = token_for(&kp, "boss", 4242, 120);
-        assert!(authorize_elevation(Some(9999), Some(&t2)).is_err());
+        assert!(elevate(Some(9999), Some(&t2)).is_err());
         // expired token: refused.
         let expired = token_for(&kp, "boss", 4242, -10);
-        assert!(authorize_elevation(Some(4242), Some(&expired)).is_err());
+        assert!(elevate(Some(4242), Some(&expired)).is_err());
         // non-admin with a valid token: refused (not permitted to elevate).
         let pt = token_for(&kp, "peon", 4343, 120);
-        assert!(authorize_elevation(Some(4343), Some(&pt)).is_err());
+        assert!(elevate(Some(4343), Some(&pt)).is_err());
         // subject mismatch: token sub != the calling uid's account.
         let mismatch = token_for(&kp, "peon", 4242, 120);
-        assert!(authorize_elevation(Some(4242), Some(&mismatch)).is_err());
+        assert!(elevate(Some(4242), Some(&mismatch)).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

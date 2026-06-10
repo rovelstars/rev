@@ -12,6 +12,7 @@ use std::sync::Arc;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
 
+use super::policy::{self, Access, Operation, Principal, Scope, Tier};
 use super::protocol::{self, Message, MessageBody};
 use super::registry;
 
@@ -81,24 +82,17 @@ struct HandleResult {
     device_session: Option<u64>,
 }
 
-/// Authorize a seat (device-arbitration) request from `peer_uid` and return the
-/// session id it may act on. Only the owner of the *active* seat session -- or
-/// root, a trusted system component -- may open or close the input/display
-/// device fds. This is the check that keeps a background or cross-user process
-/// from grabbing the foreground session's keyboard and screen; without it, any
-/// process that can reach the bus could pull a DRM/input fd and keylog or
-/// screen-grab the logged-in user. Fails closed.
-fn authorize_seat(peer_uid: Option<u32>) -> Result<u64, String> {
-    let peer = peer_uid.ok_or_else(|| "no peer identity on the connection".to_string())?;
-    let active = crate::seat::active_session()
-        .ok_or_else(|| "no active seat session to act on".to_string())?;
-    if peer == 0 {
-        return Ok(active);
-    }
-    match crate::session::owner_uid(active) {
-        Some(owner) if owner == peer => Ok(active),
-        Some(_) => Err(format!("uid {peer} does not own the active seat session")),
-        None => Err("active seat session has no owner record".to_string()),
+/// The seat session a principal may act under. The policy has already confirmed
+/// the principal is allowed to touch seat devices (active-session owner or root);
+/// this only names the session: the owner acts under its own session, root acts
+/// under whatever is currently active. Keeps the device-fd handout bound to the
+/// foreground session so a background or cross-user process can never grab the
+/// logged-in user's keyboard or screen.
+fn seat_session(principal: &Principal) -> Option<u64> {
+    match principal {
+        Principal::SessionOwner { session_id, .. } => Some(*session_id),
+        Principal::System => crate::seat::active_session(),
+        _ => None,
     }
 }
 
@@ -145,7 +139,10 @@ fn err_reply(request_id: u64, message: impl Into<String>) -> (Message, Option<Ra
 type ClientWriters =
     Arc<Mutex<HashMap<String, tokio::sync::mpsc::Sender<Message>>>>;
 
-pub async fn run(socket_path: &str) -> std::io::Result<()> {
+/// Run a WireBus server on `socket_path`. `tier` says whether this is the system
+/// Highway or a user Lane; it is threaded into every request so the policy can
+/// keep privileged and cross-scope operations off user lanes.
+pub async fn run(socket_path: &str, tier: Tier) -> std::io::Result<()> {
     let _ = std::fs::remove_file(socket_path);
 
     if let Some(parent) = std::path::Path::new(socket_path).parent() {
@@ -170,7 +167,7 @@ pub async fn run(socket_path: &str) -> std::io::Result<()> {
         let (stream, _) = listener.accept().await?;
         let clients = clients.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_client(stream, clients).await {
+            if let Err(e) = handle_client(stream, clients, tier).await {
                 // Silence expected disconnects and garbage connections
                 // (e.g. desktop services probing the socket file)
                 match e.kind() {
@@ -192,12 +189,26 @@ pub async fn run(socket_path: &str) -> std::io::Result<()> {
 async fn handle_client(
     stream: UnixStream,
     clients: ClientWriters,
+    tier: Tier,
 ) -> std::io::Result<()> {
-    // The connecting peer's uid, straight from the kernel (SO_PEERCRED). Used to
-    // authorize privilege-granting requests; a client cannot forge it.
+    // The connecting peer's uid, straight from the kernel (SO_PEERCRED). A client
+    // cannot forge it; it is the root of the principal we authorize against.
     let peer_uid = nix::sys::socket::getsockopt(&stream, nix::sys::socket::sockopt::PeerCredentials)
         .ok()
         .map(|c| c.uid());
+
+    // On a user Lane, the only legitimate peer is the lane's owner (or root).
+    // The filesystem perms enforce this too (uid:0700), but assert it here so a
+    // perms mistake cannot silently open one user's lane to another.
+    if let Tier::Lane { uid: lane_uid } = tier {
+        if !matches!(peer_uid, Some(u) if u == lane_uid || u == 0) {
+            return Ok(()); // drop: not the lane owner
+        }
+    }
+
+    // Resolve who this is, once, from unforgeable inputs.
+    let principal = resolve_principal(peer_uid);
+
     let (mut reader, mut writer) = stream.into_split();
 
     // Each client gets a channel for receiving signal deliveries.
@@ -276,7 +287,7 @@ async fn handle_client(
                     None
                 };
 
-                let result = handle_message(&msg, &clients, peer_uid).await;
+                let result = handle_message(&msg, &clients, principal, tier).await;
 
                 // Send the response frame via tokio's async writer.
                 protocol::send_message(&mut writer, &result.response).await?;
@@ -313,16 +324,112 @@ async fn handle_client(
     }
 }
 
-async fn handle_message(msg: &Message, clients: &ClientWriters, peer_uid: Option<u32>) -> HandleResult {
+/// Resolve the connecting peer into a [`Principal`] from unforgeable inputs: the
+/// socket peer uid, rev's active-session table, and the UAC admin bit. Done once
+/// per connection.
+fn resolve_principal(peer_uid: Option<u32>) -> Principal {
+    match peer_uid {
+        None => Principal::Anonymous,
+        Some(0) => Principal::System,
+        Some(uid) => {
+            // The active seat session's owner is the foreground compositor; mark
+            // it so only it may touch seat devices.
+            if let Some(sid) = crate::seat::active_session() {
+                if crate::session::owner_uid(sid) == Some(uid) {
+                    return Principal::SessionOwner { uid, session_id: sid };
+                }
+            }
+            Principal::User { uid, admin: uac_is_admin(uid) }
+        }
+    }
+}
+
+/// Whether `uid` is a UAC administrator. A failure to resolve is treated as
+/// not-admin (fail closed).
+fn uac_is_admin(uid: u32) -> bool {
+    let Ok(uac) = uac_core::Uac::open() else { return false };
+    match uac.name_by_uid(uid) {
+        Ok(Some(name)) => uac.is_admin(&name).unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// Describe a request as the internal [`Operation`] the policy understands.
+/// Returns `None` for response-only or server-initiated message bodies, which
+/// are not valid client requests and fall through to an error reply without an
+/// authorization decision. Service control is scoped by tier: on a Lane it
+/// targets that user's own services; on the Highway it targets system services.
+fn classify(body: &MessageBody, tier: Tier) -> Option<Operation> {
+    let service_scope = match tier {
+        Tier::Lane { uid } => Scope::OwnUser(uid),
+        Tier::Highway => Scope::SystemOrOtherUser,
+    };
+    Some(match body {
+        MessageBody::Lookup { .. }
+        | MessageBody::ListBus
+        | MessageBody::ListServices
+        | MessageBody::ListSessions => Operation::Read,
+
+        MessageBody::Subscribe { .. } | MessageBody::Unsubscribe { .. } => {
+            Operation::SignalSubscribe
+        }
+        // Ownership of the name is enforced in phase 4 (registry owner tracking);
+        // until then these route through the policy as owned (current behavior).
+        MessageBody::EmitSignal { .. } => Operation::SignalEmit { owns_name: true },
+        MessageBody::Register { .. } => Operation::Register { owns_namespace: true },
+        MessageBody::Unregister { .. } => Operation::Unregister { owns_name: true },
+
+        MessageBody::StartService { .. }
+        | MessageBody::StopService { .. }
+        | MessageBody::ReloadService { .. }
+        | MessageBody::Rescan => Operation::ServiceControl { scope: service_scope },
+
+        MessageBody::OpenDevice { .. }
+        | MessageBody::CloseDevice { .. }
+        | MessageBody::RestoreVt => Operation::Seat,
+
+        MessageBody::ExecAs { .. } => Operation::ExecAs,
+        MessageBody::StartSession { .. } => Operation::StartSession,
+        MessageBody::EndSession { session_id } => Operation::EndSession {
+            owner_uid: crate::session::owner_uid(*session_id),
+        },
+
+        // Responses and server-initiated notifications: not client requests.
+        _ => return None,
+    })
+}
+
+async fn handle_message(
+    msg: &Message,
+    clients: &ClientWriters,
+    principal: Principal,
+    tier: Tier,
+) -> HandleResult {
     let id = msg.id;
 
-    // Privilege-granting requests (ExecAs, StartSession) authorize against
-    // RookGuard + UAC below, keyed on the unforgeable peer uid. Other requests
-    // are non-privileged.
-    // Privileged operations that will require auth:
-    //   - Register on System Highway
-    //   - Cross-lane access (User Lane -> System Highway)
-    //   - Starting/stopping system services (non-user)
+    // The authorization choke point: every classifiable request passes through
+    // policy::authorize before it is dispatched. This is the single place that
+    // grants or denies; the handler arms below assume they are already
+    // authorized and never re-check.
+    if let Some(op) = classify(&msg.body, tier) {
+        match policy::authorize(&principal, tier, &op) {
+            Access::Allow => {}
+            Access::Deny(reason) => {
+                let (response, pass_fd) = err_reply(id, format!("denied: {reason}"));
+                return HandleResult { response, pass_fd, device_session: None };
+            }
+            Access::Elevated(purpose) => {
+                if let Err(e) = crate::auth::verify_for(principal.uid(), msg.auth_token.as_deref(), purpose) {
+                    crate::logger::write_log(
+                        "rev",
+                        &format!("{op:?} denied for uid {:?}: {e}", principal.uid()),
+                    );
+                    let (response, pass_fd) = err_reply(id, format!("denied: {e}"));
+                    return HandleResult { response, pass_fd, device_session: None };
+                }
+            }
+        }
+    }
 
     // Set by the OpenDevice arm to the session a device was opened under.
     let mut device_session: Option<u64> = None;
@@ -418,36 +525,32 @@ async fn handle_message(msg: &Message, clients: &ClientWriters, peer_uid: Option
         }
 
         // ----- Seat (device arbitration) -----
-        MessageBody::OpenDevice { path } => {
-            // Only the owner of the active seat session (or root) may pull a
-            // device fd. authorize_seat fails closed for everyone else.
-            match authorize_seat(peer_uid) {
-                Ok(session_id) => match crate::seat::open_device(session_id, path) {
-                    Ok(fd) => {
-                        // Return the Ok response AND the FD to pass.
-                        // handle_client writes the response frame first, then
-                        // sends the raw FD via SCM_RIGHTS immediately after.
-                        // The client reads the Ok, then calls recv_fd().
-                        device_session = Some(session_id);
-                        let response = make_msg(id, MessageBody::Ok {
-                            message: format!("Opened device: {}", path),
-                        });
-                        (response, Some(fd))
-                    }
-                    Err(e) => err_reply(id, e),
-                },
-                Err(e) => err_reply(id, format!("OpenDevice denied: {e}")),
-            }
-        }
-        MessageBody::CloseDevice { path } => {
-            match authorize_seat(peer_uid) {
-                Ok(session_id) => match crate::seat::close_device(session_id, path) {
-                    Ok(()) => ok_reply(id, format!("Closed device: {}", path)),
-                    Err(e) => err_reply(id, e),
-                },
-                Err(e) => err_reply(id, format!("CloseDevice denied: {e}")),
-            }
-        }
+        // The choke point already confirmed the principal is the active session
+        // owner or root; here we only resolve which session to act under.
+        MessageBody::OpenDevice { path } => match seat_session(&principal) {
+            Some(session_id) => match crate::seat::open_device(session_id, path) {
+                Ok(fd) => {
+                    // Return the Ok response AND the FD to pass.
+                    // handle_client writes the response frame first, then
+                    // sends the raw FD via SCM_RIGHTS immediately after.
+                    // The client reads the Ok, then calls recv_fd().
+                    device_session = Some(session_id);
+                    let response = make_msg(id, MessageBody::Ok {
+                        message: format!("Opened device: {}", path),
+                    });
+                    (response, Some(fd))
+                }
+                Err(e) => err_reply(id, e),
+            },
+            None => err_reply(id, "no active seat session to act on"),
+        },
+        MessageBody::CloseDevice { path } => match seat_session(&principal) {
+            Some(session_id) => match crate::seat::close_device(session_id, path) {
+                Ok(()) => ok_reply(id, format!("Closed device: {}", path)),
+                Err(e) => err_reply(id, e),
+            },
+            None => err_reply(id, "no active seat session to act on"),
+        },
         // PauseDevice and ResumeDevice are server->client only
         MessageBody::PauseDevice { .. } | MessageBody::ResumeDevice { .. } => {
             err_reply(id, "PauseDevice/ResumeDevice are server-initiated only")
@@ -460,67 +563,46 @@ async fn handle_message(msg: &Message, clients: &ClientWriters, peer_uid: Option
         }
 
         // ----- Privilege escalation -----
+        // The choke point verified the ElevateRoot token (or a root caller);
+        // here we only run the command as the target.
         MessageBody::ExecAs {
             uid,
             command,
             env,
             working_dir,
         } => {
-            // Authorize against RookGuard + UAC, keyed on the unforgeable peer
-            // uid. Fail closed: no proof, no elevation.
-            match crate::auth::authorize_elevation(peer_uid, msg.auth_token.as_deref()) {
-                Ok(caller) => {
-                    crate::logger::write_log(
-                        "rev",
-                        &format!("ExecAs authorized for {} -> run as uid {}", caller, uid),
-                    );
-                    match crate::session::exec_as(*uid, command, env, working_dir.as_ref()) {
-                        Ok(pid) => reply(id, MessageBody::ExecAsResult { pid }),
-                        Err(e) => err_reply(id, e),
-                    }
-                }
-                Err(e) => {
-                    eprintln!("rev: ExecAs from '{}' denied: {}", msg.sender, e);
-                    err_reply(id, format!("ExecAs denied: {e}"))
-                }
+            crate::logger::write_log(
+                "rev",
+                &format!("ExecAs by uid {:?} -> run as uid {}", principal.uid(), uid),
+            );
+            match crate::session::exec_as(*uid, command, env, working_dir.as_ref()) {
+                Ok(pid) => reply(id, MessageBody::ExecAsResult { pid }),
+                Err(e) => err_reply(id, e),
             }
         }
 
         // ----- Session management -----
+        // The choke point confirmed this is the system greeter (root).
         MessageBody::StartSession {
             uid,
             gid,
             username,
             command,
             env,
-        } => {
-            // Spawning a session as an arbitrary user is privileged: only a root
-            // caller (the login manager / greeter, which has already
-            // authenticated the user via RookGuard) may do it. A session for
-            // uid 0 would otherwise run a root shell for anyone.
-            if peer_uid != Some(0) {
-                eprintln!(
-                    "rev: StartSession from '{}' denied: caller is not privileged",
-                    msg.sender
-                );
-                err_reply(id, "StartSession denied: caller is not privileged".to_string())
-            } else {
-                match crate::session::start_session(*uid, *gid, username, command, env) {
-                    Ok(session) => {
-                        crate::seat::set_active_session(session.session_id);
-                        reply(
-                            id,
-                            MessageBody::SessionStarted {
-                                session_id: session.session_id,
-                                pid: session.pid,
-                                lane_socket: session.lane_socket,
-                            },
-                        )
-                    }
-                    Err(e) => err_reply(id, e),
-                }
+        } => match crate::session::start_session(*uid, *gid, username, command, env) {
+            Ok(session) => {
+                crate::seat::set_active_session(session.session_id);
+                reply(
+                    id,
+                    MessageBody::SessionStarted {
+                        session_id: session.session_id,
+                        pid: session.pid,
+                        lane_socket: session.lane_socket,
+                    },
+                )
             }
-        }
+            Err(e) => err_reply(id, e),
+        },
         MessageBody::EndSession { session_id } => {
             match crate::session::end_session(*session_id) {
                 Ok(()) => ok_reply(id, format!("Session {} ended", session_id)),
@@ -694,7 +776,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn seat_authorization() {
+    fn principal_resolution_and_seat_binding() {
         // A unique active session id for this test so it does not collide with
         // any other test touching the shared seat/session state.
         let sid = 90_001u64;
@@ -704,14 +786,22 @@ mod tests {
         crate::session::register_test_session(sid, owner);
         crate::seat::set_active_session(sid);
 
-        // Owner of the active session: authorized, gets that session id.
-        assert_eq!(authorize_seat(Some(owner)).unwrap(), sid);
-        // Root (a system component): authorized.
-        assert_eq!(authorize_seat(Some(0)).unwrap(), sid);
-        // A different local user: denied -- this is the cross-user device-fd
-        // theft the gate exists to stop.
-        assert!(authorize_seat(Some(other)).is_err());
-        // No peer identity on the connection: denied (fail closed).
-        assert!(authorize_seat(None).is_err());
+        // The active session's owner resolves to SessionOwner with that session;
+        // the policy then allows seat access (covered in bus::policy tests).
+        let p = resolve_principal(Some(owner));
+        assert_eq!(p, Principal::SessionOwner { uid: owner, session_id: sid });
+        assert_eq!(seat_session(&p), Some(sid));
+
+        // Root is System and acts under whatever session is active.
+        assert_eq!(resolve_principal(Some(0)), Principal::System);
+        assert_eq!(seat_session(&Principal::System), Some(sid));
+
+        // A different user is a plain User (not the active compositor); the
+        // policy denies its seat access, and it has no seat session to act under.
+        assert!(matches!(resolve_principal(Some(other)), Principal::User { uid, .. } if uid == other));
+        assert_eq!(seat_session(&Principal::User { uid: other, admin: false }), None);
+
+        // No peer credential: Anonymous, denied everything by the policy.
+        assert_eq!(resolve_principal(None), Principal::Anonymous);
     }
 }

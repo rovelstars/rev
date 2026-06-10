@@ -69,7 +69,7 @@ impl LaneManager {
         let path_clone = socket_path.clone();
         tokio::spawn(async move {
             tokio::select! {
-                result = super::server::run(&socket_str) => {
+                result = super::server::run(&socket_str, super::policy::Tier::Lane { uid }) => {
                     if let Err(e) = result {
                         eprintln!("rev: user lane {} failed: {}", uid, e);
                     }

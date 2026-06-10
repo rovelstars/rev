@@ -141,7 +141,7 @@ pub async fn run(auto_start: bool) {
     };
 
     tokio::select! {
-        result = crate::bus::server::run(&socket_str) => {
+        result = crate::bus::server::run(&socket_str, crate::bus::policy::Tier::Highway) => {
             if let Err(e) = result {
                 eprintln!("rev: wirebus server error: {}", e);
             }

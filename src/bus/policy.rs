@@ -20,10 +20,6 @@
 //! [`Access::Elevated`] naming the purpose, and the caller verifies a token for
 //! that purpose against the principal.
 
-// Transitional: the policy types are exercised by the unit tests but not yet
-// wired into the message handler (phase 2). Removed once the choke point lands.
-#![allow(dead_code)]
-
 use rook_core::policy::Purpose;
 
 /// Who is making a request, resolved once when the connection is accepted. Every
