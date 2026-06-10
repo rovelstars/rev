@@ -31,6 +31,9 @@ pub struct LaneManager {
 struct LaneHandle {
     socket_path: PathBuf,
     shutdown_tx: tokio::sync::oneshot::Sender<()>,
+    /// PIDs of the user's scope=user services started on this lane, killed when
+    /// the lane is torn down (logout).
+    service_pids: Vec<u32>,
 }
 
 /// Returns the socket path for a user lane.
@@ -100,6 +103,7 @@ impl LaneManager {
             LaneHandle {
                 socket_path: socket_path.clone(),
                 shutdown_tx,
+                service_pids: Vec::new(),
             },
         );
 
@@ -107,13 +111,27 @@ impl LaneManager {
         Ok(socket_path)
     }
 
+    /// Record a scope=user service started on `uid`'s lane, so it is killed when
+    /// the lane is torn down. No-op if the lane is not active.
+    pub fn record_service(&self, uid: u32, pid: u32) {
+        if let Some(handle) = self.active.lock().expect("lanes lock poisoned").get_mut(&uid) {
+            handle.service_pids.push(pid);
+        }
+    }
+
     /// Stop a User Lane for the given uid. Sync, so the zombie reaper thread can
-    /// call it on unexpected session exit: it only signals the lane server task
-    /// (running on the runtime) to shut down and removes the socket file.
+    /// call it on unexpected session exit: it SIGTERMs the user's services,
+    /// signals the lane server task (running on the runtime) to shut down, and
+    /// removes the socket file.
     pub fn stop_lane(&self, uid: u32) -> Result<(), String> {
         let mut active = self.active.lock().expect("lanes lock poisoned");
         match active.remove(&uid) {
             Some(handle) => {
+                for pid in handle.service_pids {
+                    unsafe {
+                        libc::kill(pid as i32, libc::SIGTERM);
+                    }
+                }
                 let _ = handle.shutdown_tx.send(());
                 let _ = std::fs::remove_file(&handle.socket_path);
                 Ok(())

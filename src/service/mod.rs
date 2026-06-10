@@ -251,6 +251,129 @@ pub fn start_known_service(name: &str) -> bool {
     services::get_service(name).map(|i| i.is_running).unwrap_or(false)
 }
 
+/// Start a user's `scope=user` services on their Lane, as the user.
+///
+/// Gathers OOTB/system-installed user-scope defaults from the system service
+/// dirs plus the account's vault-installed services, dependency-orders them, and
+/// forks each dropped to (uid, gid) with `WIREBUS_SOCKET` pointed at the lane.
+/// Each PID is recorded with the lane so logout tears it down. These run
+/// detached from the system service table (names are per-user, so they would
+/// collide), so they are reaped but not auto-restarted for now.
+pub fn start_user_services(
+    uid: u32,
+    gid: u32,
+    lane_socket: &std::path::Path,
+    account_uuid: &str,
+) {
+    let mut candidates: Vec<(String, ServiceConfig, std::path::PathBuf)> = Vec::new();
+    for dir in crate::parser::service_dirs() {
+        collect_user_scope(&dir, &mut candidates);
+    }
+    collect_user_scope(
+        &crate::bus::lanes::user_service_dir(account_uuid),
+        &mut candidates,
+    );
+    if candidates.is_empty() {
+        return;
+    }
+
+    let sortable: Vec<(String, ServiceConfig)> = candidates
+        .iter()
+        .map(|(name, config, _)| (name.clone(), config.clone()))
+        .collect();
+    let (order, _forced) = crate::init::ordering::start_order(&sortable);
+    for idx in order {
+        let (name, config, _) = &candidates[idx];
+        if let Some(pid) = spawn_lane_service(name, config, uid, gid, lane_socket) {
+            crate::bus::lanes::LANES.record_service(uid, pid);
+        }
+    }
+}
+
+/// Collect parseable `scope=user` services from `dir` into `out`.
+fn collect_user_scope(
+    dir: &std::path::Path,
+    out: &mut Vec<(String, ServiceConfig, std::path::PathBuf)>,
+) {
+    if !dir.exists() {
+        return;
+    }
+    for entry in walkdir::WalkDir::new(dir).into_iter().flatten() {
+        let path = entry.path();
+        if path.is_file()
+            && path.extension().and_then(|s| s.to_str()) == Some("rsc")
+            && let Some(config) = std::fs::read_to_string(path)
+                .ok()
+                .and_then(|t| crate::parser::deserialize_service_config(&t).ok())
+            && config.scope == crate::parser::ServiceScope::User
+        {
+            out.push((config.name.clone(), config, path.to_path_buf()));
+        }
+    }
+}
+
+/// Fork/exec one scope=user service as the lane's user. Returns the child PID,
+/// or None on failure. The service's identity is the logged-in user (the lane
+/// owner), never the config's `user=` field, so a user-scope service cannot ask
+/// to run as someone else.
+fn spawn_lane_service(
+    name: &str,
+    config: &ServiceConfig,
+    uid: u32,
+    gid: u32,
+    lane_socket: &std::path::Path,
+) -> Option<u32> {
+    let args = match shell_words::split(&config.exec_start) {
+        Ok(a) if !a.is_empty() => a,
+        _ => {
+            eprintln!("rev: user service {}: invalid exec-start", name);
+            return None;
+        }
+    };
+
+    match unsafe { nix::unistd::fork() } {
+        Ok(nix::unistd::ForkResult::Parent { child, .. }) => {
+            println!("rev: started user service {} (PID {}, uid {})", name, child, uid);
+            Some(child.as_raw() as u32)
+        }
+        #[allow(unreachable_code)]
+        Ok(nix::unistd::ForkResult::Child) => {
+            unsafe {
+                let grp = [gid as libc::gid_t];
+                if libc::setgroups(1, grp.as_ptr()) != 0
+                    || libc::setgid(gid as libc::gid_t) != 0
+                    || libc::setuid(uid as libc::uid_t) != 0
+                {
+                    eprintln!("rev: user service {}: failed to drop to {}:{}", name, uid, gid);
+                    std::process::exit(1);
+                }
+                // Minimal environment: point the service at its lane bus, then
+                // layer the service's own env on top.
+                std::env::set_var("WIREBUS_SOCKET", lane_socket);
+                std::env::set_var("PATH", "/Core/Bin:/Construct/Bin");
+                for (key, value) in &config.env {
+                    std::env::set_var(key, value);
+                }
+            }
+            if let Some(ref dir) = config.working_dir {
+                let _ = nix::unistd::chdir(dir.as_path());
+            }
+            use std::ffi::CString;
+            let cstr: Vec<CString> = args
+                .iter()
+                .map(|a| CString::new(a.clone()).expect("invalid argument"))
+                .collect();
+            let refs: Vec<&std::ffi::CStr> = cstr.iter().map(|s| s.as_c_str()).collect();
+            nix::unistd::execv(&cstr[0], &refs).expect("execv failed");
+            unreachable!()
+        }
+        Err(e) => {
+            eprintln!("rev: user service {}: fork failed: {}", name, e);
+            None
+        }
+    }
+}
+
 /// Resolve the (uid, gid) a service should run as from its `user`/`group`
 /// fields. `user` is a numeric uid or a UAC account name; `group` overrides the
 /// gid with a numeric value. Returns None when the user cannot be resolved, so
@@ -403,7 +526,30 @@ fn spawn_running(config: &ServiceConfig) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_run_as;
+    use super::{collect_user_scope, resolve_run_as};
+    use crate::parser::{ServiceConfig, ServiceScope};
+
+    #[test]
+    fn collect_user_scope_takes_only_user_services() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, scope: ServiceScope| {
+            let cfg = ServiceConfig {
+                name: name.to_string(),
+                exec_start: "/bin/true".to_string(),
+                scope,
+                ..Default::default()
+            };
+            let toml = crate::parser::serialize_service_config(&cfg).unwrap();
+            std::fs::write(dir.path().join(format!("{name}.rsc")), toml).unwrap();
+        };
+        write("a-user", ServiceScope::User);
+        write("b-system", ServiceScope::System);
+
+        let mut out = Vec::new();
+        collect_user_scope(dir.path(), &mut out);
+        let names: Vec<&str> = out.iter().map(|(n, _, _)| n.as_str()).collect();
+        assert_eq!(names, ["a-user"]);
+    }
 
     #[test]
     fn numeric_user_resolves_without_uac() {

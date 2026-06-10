@@ -687,6 +687,15 @@ async fn handle_message(
             match crate::session::start_session(*uid, *gid, username, command, env) {
             Ok(session) => {
                 crate::seat::set_active_session(session.session_id);
+                // Start the user's scope=user services on their lane. Keyed by
+                // the account UUID so vault-installed services are found.
+                if let Some(uuid) = uac_core::Uac::open()
+                    .ok()
+                    .and_then(|u| u.get(username).ok())
+                    .map(|a| a.uuid)
+                {
+                    crate::service::start_user_services(*uid, *gid, &session.lane_socket, &uuid);
+                }
                 reply(
                     id,
                     MessageBody::SessionStarted {
