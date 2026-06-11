@@ -160,6 +160,54 @@ fn err_reply(request_id: u64, message: impl Into<String>) -> (Message, Option<Ra
     )
 }
 
+/// The shared session-launch tail, used by StartSession (greeter/root) and
+/// StartSessionAuth (compositor login, after the password check passes): bring
+/// up the user's Lane, fork/setuid/exec the session command, mark the session
+/// active on the seat, start the user's scope=user services, and build the
+/// SessionStarted reply. Keeping it in one place stops the two login entry
+/// points from drifting.
+fn launch_session(
+    id: u64,
+    uid: u32,
+    gid: u32,
+    username: &str,
+    command: &[String],
+    env: &HashMap<String, String>,
+) -> (Message, Option<RawFd>) {
+    if command.is_empty() {
+        return err_reply(id, "session command cannot be empty");
+    }
+    // Bring the user's Lane bus up before launching the session, so the session
+    // command finds it listening at $WIREBUS_SOCKET.
+    if let Err(e) = crate::bus::lanes::LANES.start_lane(uid) {
+        eprintln!("rev: could not start lane for uid {}: {}", uid, e);
+    }
+    match crate::session::start_session(uid, gid, username, command, env) {
+        Ok(session) => {
+            crate::seat::set_active_session(session.session_id);
+            // Start the user's scope=user services on their lane. Keyed by the
+            // account UUID so vault-installed services are found.
+            if let Some(uuid) = uac_core::Uac::open()
+                .ok()
+                .and_then(|u| u.get(username).ok())
+                .map(|a| a.uuid)
+            {
+                crate::service::start_user_services(uid, gid, &session.lane_socket, &uuid);
+            }
+            reply(
+                id,
+                MessageBody::SessionStarted {
+                    session_id: session.session_id,
+                    uid,
+                    pid: session.pid,
+                    lane_socket: session.lane_socket,
+                },
+            )
+        }
+        Err(e) => err_reply(id, e),
+    }
+}
+
 /// Connected clients keyed by their self-declared sender name.
 /// Used for signal delivery — when a signal fires, we look up subscribers
 /// and write to their writer halves.
@@ -458,6 +506,7 @@ fn classify(
 
         MessageBody::ExecAs { .. } => Operation::ExecAs,
         MessageBody::StartSession { .. } => Operation::StartSession,
+        MessageBody::StartSessionAuth { .. } => Operation::StartSessionAuth,
         MessageBody::EndSession { session_id } => Operation::EndSession {
             owner_uid: crate::session::owner_uid(*session_id),
         },
@@ -678,34 +727,37 @@ async fn handle_message(
             username,
             command,
             env,
+        } => launch_session(id, *uid, *gid, username, command, env),
+
+        // The choke point confirmed the caller may initiate logins (the system
+        // greeter today). Unlike StartSession, the caller is not trusted to name
+        // the identity: rev verifies the password with RookGuard, then resolves
+        // the account's real uid/gid through UAC before launching.
+        MessageBody::StartSessionAuth {
+            username,
+            password,
+            command,
+            env,
         } => {
-            // Bring the user's Lane bus up before launching the session, so the
-            // session command finds it listening at $WIREBUS_SOCKET.
-            if let Err(e) = crate::bus::lanes::LANES.start_lane(*uid) {
-                eprintln!("rev: could not start lane for uid {}: {}", uid, e);
-            }
-            match crate::session::start_session(*uid, *gid, username, command, env) {
-            Ok(session) => {
-                crate::seat::set_active_session(session.session_id);
-                // Start the user's scope=user services on their lane. Keyed by
-                // the account UUID so vault-installed services are found.
-                if let Some(uuid) = uac_core::Uac::open()
-                    .ok()
-                    .and_then(|u| u.get(username).ok())
-                    .map(|a| a.uuid)
-                {
-                    crate::service::start_user_services(*uid, *gid, &session.lane_socket, &uuid);
+            // The rookd round-trip is blocking std::io; run it off the reactor.
+            let (u, p) = (username.clone(), password.clone());
+            let verdict = tokio::task::spawn_blocking(move || {
+                crate::auth::authenticate_login(&u, &p)
+            })
+            .await;
+            match verdict {
+                Ok(Ok(())) => match crate::auth::resolve_login(username) {
+                    Ok(t) => launch_session(id, t.uid, t.gid, &t.name, command, env),
+                    Err(e) => err_reply(id, e),
+                },
+                Ok(Err(e)) => {
+                    crate::logger::write_log(
+                        "rev",
+                        &format!("login denied for {username}: {e}"),
+                    );
+                    err_reply(id, e)
                 }
-                reply(
-                    id,
-                    MessageBody::SessionStarted {
-                        session_id: session.session_id,
-                        pid: session.pid,
-                        lane_socket: session.lane_socket,
-                    },
-                )
-            }
-            Err(e) => err_reply(id, e),
+                Err(e) => err_reply(id, format!("auth task failed: {e}")),
             }
         }
         MessageBody::EndSession { session_id } => {

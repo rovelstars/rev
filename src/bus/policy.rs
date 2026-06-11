@@ -103,6 +103,10 @@ pub enum Operation {
     ExecAs,
     /// Start a new user session (login). Greeter-only. Highway-only.
     StartSession,
+    /// Authenticate a user and start their session in one step (the unprivileged
+    /// compositor-greeter login path). Greeter-only today; the password is then
+    /// proven to RookGuard before anything runs. Highway-only.
+    StartSessionAuth,
     /// End a session. The owner may end their own; ending another's is
     /// cross-scope. `owner_uid` is the session's owner, if known.
     EndSession { owner_uid: Option<u32> },
@@ -131,7 +135,10 @@ fn deny(reason: impl Into<String>) -> Access {
 fn highway_only(op: &Operation) -> bool {
     matches!(
         op,
-        Operation::Seat | Operation::ExecAs | Operation::StartSession
+        Operation::Seat
+            | Operation::ExecAs
+            | Operation::StartSession
+            | Operation::StartSessionAuth
     ) || matches!(
         op,
         Operation::ServiceControl { scope: Scope::SystemOrOtherUser }
@@ -225,6 +232,16 @@ pub fn authorize(principal: &Principal, tier: Tier, op: &Operation) -> Access {
 
         // Spawning a login session is the greeter's job, and the greeter is root.
         Operation::StartSession => match principal {
+            Principal::System => Access::Allow,
+            _ => deny("only the system greeter may start sessions"),
+        },
+
+        // Authenticate-and-start. The greeter is root today (the VM compositor
+        // runs as System). When the compositor becomes a dedicated unprivileged
+        // display account, this gains a seat-identity allowance for that account
+        // alone; the password is proven to RookGuard either way, so this gate
+        // only decides who may *initiate* a login, not who may log in.
+        Operation::StartSessionAuth => match principal {
             Principal::System => Access::Allow,
             _ => deny("only the system greeter may start sessions"),
         },
@@ -357,6 +374,23 @@ mod tests {
         assert_eq!(authorize(&Principal::System, HIGHWAY, &Operation::StartSession), Access::Allow);
         assert!(matches!(
             authorize(&admin(1000), HIGHWAY, &Operation::StartSession),
+            Access::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn start_session_auth_is_greeter_only_and_highway_only() {
+        assert_eq!(
+            authorize(&Principal::System, HIGHWAY, &Operation::StartSessionAuth),
+            Access::Allow
+        );
+        assert!(matches!(
+            authorize(&admin(1000), HIGHWAY, &Operation::StartSessionAuth),
+            Access::Deny(_)
+        ));
+        // A user lane is never a login path, even for root.
+        assert!(matches!(
+            authorize(&Principal::System, Tier::Lane { uid: 0 }, &Operation::StartSessionAuth),
             Access::Deny(_)
         ));
     }

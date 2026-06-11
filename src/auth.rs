@@ -8,13 +8,61 @@
 //! it opens UAC, loads rookd's public key, owns the process's single-use nonce
 //! cache, and maps errors to the strings rev's bus replies with.
 
+use rook_core::ipc::{self, Request, Response};
 use rook_core::policy::Purpose;
 use rook_elevate::{authorize_for, now, rookd_pubkey, NonceCache};
+use std::collections::BTreeMap;
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use uac_core::Uac;
 
 pub use rook_elevate::{env_allowed, Target};
+
+/// rookd's socket path (ROOKD_SOCK env, else the RookGuard default).
+fn rookd_sock() -> PathBuf {
+    std::env::var_os("ROOKD_SOCK")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/Transit/Ephemeral/RookGuard/rookd.sock"))
+}
+
+/// Verify a login password for `username` against RookGuard, for the
+/// StartSessionAuth (compositor-greeter login) path. rev is root, so rookd
+/// permits it to authenticate an arbitrary account; the purpose is
+/// FirstUnlockAfterBoot -- the knowledge-only unlock that, in the full model,
+/// arms biometrics and unwraps the user's data key for the rest of the boot.
+/// Returns Ok on Granted; Err carries the rookd reason (locked-out, denied) so
+/// the greeter can show it. This is a blocking std::io round-trip; callers on
+/// the async reactor must run it under spawn_blocking.
+pub fn authenticate_login(username: &str, password: &str) -> Result<(), String> {
+    let sock = rookd_sock();
+    let mut stream = UnixStream::connect(&sock)
+        .map_err(|e| format!("connect rookd {}: {e}", sock.display()))?;
+    let mut secrets = BTreeMap::new();
+    secrets.insert("password".to_string(), password.to_string());
+    let req = Request::Authenticate {
+        user: username.to_string(),
+        purpose: Purpose::FirstUnlockAfterBoot,
+        timeout_ms: 5_000,
+        secrets,
+    };
+    ipc::write_msg(&mut stream, &req).map_err(|e| format!("rookd write: {e}"))?;
+    match ipc::read_msg::<Response, _>(&mut stream).map_err(|e| format!("rookd read: {e}"))? {
+        Response::Granted { .. } => Ok(()),
+        Response::Locked { retry_after_secs } => {
+            Err(format!("account locked; retry in {retry_after_secs}s"))
+        }
+        Response::Denied { reason } => Err(format!("authentication failed: {reason}")),
+        other => Err(format!("unexpected rookd reply: {other:?}")),
+    }
+}
+
+/// Resolve a login account name to its real uid/gid/home/shell through UAC, so
+/// the StartSessionAuth path never trusts a caller-supplied identity.
+pub fn resolve_login(username: &str) -> Result<Target, String> {
+    let uac = Uac::open().map_err(|e| format!("open UAC: {e}"))?;
+    rook_elevate::resolve_by_name(&uac, username).map_err(|e| format!("{e:#}"))
+}
 
 /// Token nonces rev has already redeemed (single-use within the TTL). Process
 /// lifetime; shared with rexecd's behaviour via the same `rook-elevate` logic.
